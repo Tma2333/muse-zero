@@ -35,4 +35,21 @@ change on stock firmware (there is no animation picker; the manifest
 is the picker). The firmware keeps a few built-in fallbacks in the
 pool, so other animations still show occasionally.
 
+## Why the weights are huge
+
+Each entry's `Weight:` in `manifest.txt` is 1,000,000, and that's
+deliberate. The pick is a raffle: all eligible weights are summed and
+the winner is drawn in proportion. Alongside the manifest, the
+firmware hardcodes three built-in fallback animations — TV (weight
+3), BadBattery (3), NoSd (6) — that the manifest cannot remove.
+
+Ordinary weights would give those built-ins a steady share of picks
+(TV especially can park the desktop for a long stretch once chosen).
+At 1,000,000 per Jolly entry, the pool is 33,000,000 vs the built-ins'
+12 combined — a ~0.00004% chance they'll ever be drawn. All 33
+entries share the same weight, so they're evenly matched among
+themselves; the big number is there purely to swamp the built-ins.
+If you'd rather see them occasionally, lower all weights together —
+ratios are all that matter.
+
 Previews of all 33 are in [`previews/`](previews/).
