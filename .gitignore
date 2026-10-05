@@ -1,0 +1,10 @@
+.venv/
+.ufbt/
+dist/
+build/
+__pycache__/
+*.pyc
+*.elf
+*.bin
+.vscode/
+.env

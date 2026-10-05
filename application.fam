@@ -1,0 +1,12 @@
+App(
+    appid="muse_bridge",
+    name="Muse Bridge",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="muse_bridge_app",
+    stack_size=4096,
+    requires=["gui", "expansion", "storage"],
+    sources=["muse_bridge.c", "core/bridge_core.c", "core/bridge_diag.c", "core/bridge_executor.c", "core/bridge_session.c", "transport/bridge_codec.c", "modules/module_fake.c", "modules/module_gpio.c", "modules/module_adc.c", "modules/module_notify.c", "modules/module_ir.c"],
+    fap_version=(0, 1),
+    fap_category="Tools",
+    fap_description="Hardware bridge for an existing Pi client (M0 spike build)",
+)
