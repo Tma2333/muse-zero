@@ -11,11 +11,15 @@ growing shell of assets, instructions, and scripts around it.
 
 | Section | What it is |
 |---|---|
-| [`bridge/`](bridge/) | **The center**: the comm link between Muse and the Flipper. `bridge/flipper-app/` is the Muse Bridge app running on the Flipper; `bridge/pi-host/` is the Pi-side transport and driver; `bridge/protocol.md` is the wire protocol between them. |
-| [`animations/`](animations/) | Drop-in desktop animation assets — the complete "Jolly" pack, ready to copy onto a Flipper, plus the tools that make more. |
+| [`muse_bridge/`](muse_bridge/) | **The center**: the Muse Bridge app on the Flipper (`muse_bridge.c`, `core/`, `transport/`, `modules/`, `tests/`, `tools/`), its Pi-side half (`pi_host/`), and the wire spec (`protocol.md`). |
+| [`jolly_animations/`](jolly_animations/) | Drop-in desktop animation assets — the complete "Jolly" pack with previews, ready to copy onto a Flipper. |
 | [`workflows/`](workflows/) | Guided procedures an AI assistant can follow with this hardware (coming). |
 | [`flipper-scripts/`](flipper-scripts/) | Programs and content that run on the Flipper side (coming). |
 | [`pi-scripts/`](pi-scripts/) | Scripts that run on the Pi to drive hardware and workflows (coming). |
+
+Setup guides are split the same way: [`SETUP.md`](SETUP.md) covers
+the general Muse ↔ Flipper link (Pi, wiring, stock RPC); the bridge
+app and the animations each have their own SETUP in their folders.
 
 ## Why a Pi in the middle?
 
@@ -61,7 +65,7 @@ See [ROADMAP.md](ROADMAP.md).
 Point your Muse at [SETUP.md](SETUP.md) — written to be followed
 step-by-step, by a human or an AI agent with shell access to the Pi.
 Just want the dancing robot on your Flipper? See
-[animations/README.md](animations/README.md).
+[jolly_animations/README.md](jolly_animations/README.md).
 
 ## Safety posture
 
