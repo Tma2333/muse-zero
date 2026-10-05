@@ -22,6 +22,4 @@ speed they run on the Flipper.
 
 Format: 128×64 monochrome, 36 frames per set, 3 fps, duration 48, in
 the standard `frame_N.bm` + `meta.txt` layout stock firmware reads
-from `/ext/dolphin/`, registered in the included `manifest.txt`. One
-retired early draft lives in [`retired/`](retired/) — it's not in the
-manifest.
+from `/ext/dolphin/`, registered in the included `manifest.txt`.
