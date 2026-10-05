@@ -97,7 +97,7 @@ this repo's `pi/` are layered on the pyflipper fork
 ```bash
 mkdir -p ~/flipper-rpc && cd ~/flipper-rpc
 git clone https://github.com/gorg2331/pyflipper.git pyflipper-src
-cp /path/to/muse-zero/pi/*.py .
+cp /path/to/muse-zero/bridge/pi-host/*.py .
 export PYTHONPATH=$PWD/pyflipper-src/src:$PWD
 ~/flipper-rpc/.venv/bin/python flipper_driver.py info
 ```
@@ -113,7 +113,7 @@ reads `FLIPPER_RPC_DIR` if you put it elsewhere.
 ```bash
 pip install ufbt           # or use a project venv
 ufbt update --branch=1.4.3 # match your firmware branch
-ufbt build                 # in this repo's root → dist/muse_bridge.fap
+ufbt build                 # in bridge/flipper-app/ → dist/muse_bridge.fap
 ```
 
 ## 7. Install and talk to it
@@ -125,7 +125,7 @@ launch the app (Apps → Tools → Muse Bridge) or from the Pi.
 Self-tests (run on the Pi, app running):
 
 ```bash
-cd tools
+cd bridge/flipper-app/tools
 FLIPPER_RPC_DIR=~/flipper-rpc ~/flipper-rpc/.venv/bin/python bridge_hil.py --case C04
 ```
 

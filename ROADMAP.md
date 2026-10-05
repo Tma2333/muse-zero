@@ -34,6 +34,8 @@ advertised capability list.
 
 - [ ] Pi-side workflow layer: multi-step physical workflows with
       journaling, capture storage, and agent-facing tools
+- [ ] First workflow write-ups in `workflows/`; helper scripts in
+      `pi-scripts/` and `flipper-scripts/` as the rig grows
 - [ ] On-device status UI: truthful link/job pages and local stop
 - [ ] Backpack (Pi Zero 2 W) bring-up as the always-on rig
 
