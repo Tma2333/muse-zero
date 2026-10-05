@@ -13,9 +13,6 @@ growing shell of assets, instructions, and scripts around it.
 |---|---|
 | [`muse_bridge/`](muse_bridge/) | **The center**: the Muse Bridge app on the Flipper (`muse_bridge.c`, `core/`, `transport/`, `modules/`, `tests/`, `tools/`), its Pi-side half (`pi_host/`), and the wire spec (`protocol.md`). |
 | [`jolly_animations/`](jolly_animations/) | Drop-in desktop animation assets — the complete "Jolly" pack with previews, ready to copy onto a Flipper. |
-| [`workflows/`](workflows/) | Guided procedures an AI assistant can follow with this hardware (coming). |
-| [`flipper-scripts/`](flipper-scripts/) | Programs and content that run on the Flipper side (coming). |
-| [`pi-scripts/`](pi-scripts/) | Scripts that run on the Pi to drive hardware and workflows (coming). |
 
 Setup guides are split the same way: [`SETUP.md`](SETUP.md) covers
 the general Muse ↔ Flipper link (Pi, wiring, stock RPC); the bridge
