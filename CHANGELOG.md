@@ -16,4 +16,4 @@ Flipper firmware 1.4.3 (Raspberry Pi host, UART on header pins 13/14):
 - Protocol documented in `docs/protocol.md`
 
 Not in this build (by design): any transmit/emulation feature, tag
-writing. See `ROADMAP.md`.
+writing. Roadmap lives in the README.

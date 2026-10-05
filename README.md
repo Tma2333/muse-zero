@@ -3,7 +3,9 @@
 **Give an AI assistant hands that can touch the physical world — safely,
 provably, one verified capability at a time.**
 
-## What is Muse Zero?
+## Introduction
+
+### What is Muse Zero?
 
 Muse Zero connects Muse to a Flipper Zero through a Raspberry Pi
 (Flipper Zero + Pi Zero + Muse). Muse lives on the Pi; the Pi talks to
@@ -19,7 +21,7 @@ trust: one owner at a time, leases that expire when the link dies,
 exactly-once execution (a repeated request replays its result instead
 of running twice), and hard stops for anything that transmits.
 
-## What can it do?
+### What can it do?
 
 Today, on stock Flipper firmware:
 
@@ -36,7 +38,7 @@ multi-step physical procedures.
 Plus a lighter side: the **Jolly animations**, 33 desktop animations
 that make any Flipper a little more alive — no bridge required.
 
-## Safety by design
+### Safety by design
 
 - **Leases, not trust** — if the link dies, control expires and any
   running job stops; nothing keeps acting on stale instructions.
@@ -62,11 +64,51 @@ that make any Flipper a little more alive — no bridge required.
   written so an AI assistant can follow it. The bridge app has its own
   guide in [muse_bridge/SETUP.md](muse_bridge/SETUP.md).
 
-## Status
+## Roadmap
 
-Foundation released and verified on real hardware; expansion modules
-(NFC, RFID, iButton, Sub-GHz) in progress, one at a time. Details and
-direction in [ROADMAP.md](ROADMAP.md) and [CHANGELOG.md](CHANGELOG.md).
+High-level only; every item lands as a module behind the session/
+executor foundation, verified on real hardware before it joins the
+advertised capability list. Release history: [CHANGELOG.md](CHANGELOG.md).
+
+**Done**
+
+- [x] Session foundation: handshake, expiring leases, one owner at a
+      time, same-client resume
+- [x] Exactly-once actions with cancellation, deadlines, and
+      post-restart outcome lookup
+- [x] Diagnostic trace readable over the wire
+- [x] GPIO: configure/read/write/release with auto-release on link loss
+- [x] Analog voltage reads (multi-sample averaged)
+- [x] Finite notifications: LED flash, beep, vibration
+- [x] Infrared receive: decoded signals with sequenced event streams
+
+**Next**
+
+- [ ] One verified finite IR transmission (needs a bench IR receiver
+      fixture to independently confirm exactly one frame)
+- [ ] Release qualification: endurance cycles, long fault soak,
+      release build, pinned build artifact
+- [ ] NFC discovery and card identification
+- [ ] LF RFID read
+- [ ] iButton read
+- [ ] Sub-GHz receive: signal strength, then one decoded format
+- [ ] Scoped file storage transfers
+
+**Later**
+
+- [ ] Pi-side workflow layer: multi-step physical workflows with
+      journaling and agent-facing tools
+- [ ] On-device status UI: truthful link/job pages, local stop
+- [ ] Backpack (Pi Zero 2 W) bring-up as the always-on rig
+
+**Optional, individually gated**
+
+- [ ] IR raw capture/replay objects
+- [ ] NFC / LF RFID / iButton emulation — one combination at a time,
+      each proven against an independent reader and each behind
+      explicit human confirmation
+- [ ] Tag writing — a separate feature, deliberately not implied by
+      read/emulate support
 
 ## License
 
