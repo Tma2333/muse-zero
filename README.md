@@ -7,7 +7,7 @@ Muse Zero connects Muse to a Flipper Zero through a Raspberry Pi
 (Flipper Zero + Pi Zero + Muse). It is one project with a center and a
 growing shell of assets, instructions, and scripts around it.
 
-## The map
+## Projects
 
 | Section | What it is |
 |---|---|
