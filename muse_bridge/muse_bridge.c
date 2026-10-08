@@ -3,9 +3,9 @@
  *
  * Takes the raw USART from the expansion service (expansion_disable ->
  * serial acquire, per expansion.h), frames Pi traffic with the COBS/CRC
- * fallback protocol (§6.3/§6.5), answers bootstrap PING/GET_INFO,
+ * fallback protocol (plan §6.3/§6.5), answers bootstrap PING/GET_INFO,
  * and restores everything on exit (release -> expansion_enable).
- * The executor thread runs the one-job slot (§5.1/§9); in this
+ * The executor thread runs the one-job slot (plan §5.1/§9); in this
  * qualification build it executes a single internally-triggered fake
  * job shortly after launch. Fake actions are NOT reachable from the
  * wire; sessions/ledger arrive in M2, hardware modules in M3+.
@@ -35,12 +35,17 @@
 #include "core/bridge_session.h"
 #include "transport/bridge_codec.h"
 #include "modules/module_fake.h"
+#include "core/bridge_build_config.h"
 #include "modules/module_gpio.h"
 #include "modules/module_adc.h"
 #include "modules/module_notify.h"
 #include "modules/module_ir.h"
 
-#define BRIDGE_BUILD_ID "mb-0.10-c12-1"
+#if MB_RELEASE_BUILD
+#define BRIDGE_BUILD_ID "mb-1.0-rel-1"
+#else
+#define BRIDGE_BUILD_ID "mb-0.11-c13-2"
+#endif
 #define BRIDGE_BAUD 230400
 #define BRIDGE_AUTO_EXIT_MS (90U * 1000U) /* was 20 s only in the c05h diagnostic build */
 #define BRIDGE_PARTIAL_MS 250U
@@ -93,6 +98,7 @@ typedef struct {
     NotificationApp* notification;
     /* C12 IR receive: async worker module. */
     MbIrParams ir_params;
+    MbIrTxParams ir_tx_params;
     MbIrHal ir_hal;
     InfraredWorker* ir_worker;
     /* C07 wire job: the executor's current action sequence (0 = none)
@@ -502,6 +508,47 @@ static void bridge_ir_rx_stop(void* ctx) {
     app->ir_worker = NULL;
 }
 
+/* ---- C13 IR TX glue. The get-signal callback runs on the worker
+ * thread: the portable finite provider decides New/Stop; on New we
+ * stage the decoded message into the worker and return New. The
+ * message-sent callback just bumps the portable counter. ---- */
+static InfraredWorkerGetSignalResponse bridge_ir_tx_get_signal(void* ctx, InfraredWorker* instance) {
+    UNUSED(ctx);
+    uint8_t proto = 0;
+    uint32_t addr = 0, cmd = 0;
+    if(mb_ir_tx_supply(&proto, &addr, &cmd) != MB_IR_TX_NEW) {
+        return InfraredWorkerGetSignalResponseStop;
+    }
+    InfraredMessage msg = {
+        .protocol = InfraredProtocolNEC, .address = addr, .command = cmd, .repeat = false};
+    infrared_worker_set_decoded_signal(instance, &msg);
+    return InfraredWorkerGetSignalResponseNew;
+}
+
+static void bridge_ir_tx_sent(void* ctx) {
+    UNUSED(ctx);
+    mb_ir_tx_on_sent();
+}
+
+static bool bridge_ir_tx_start(void* ctx) {
+    BridgeApp* app = ctx;
+    if(app->ir_worker != NULL) return false;
+    app->ir_worker = infrared_worker_alloc();
+    if(app->ir_worker == NULL) return false;
+    infrared_worker_tx_set_get_signal_callback(app->ir_worker, bridge_ir_tx_get_signal, app);
+    infrared_worker_tx_set_signal_sent_callback(app->ir_worker, bridge_ir_tx_sent, app);
+    infrared_worker_tx_start(app->ir_worker);
+    return true;
+}
+
+static void bridge_ir_tx_stop(void* ctx) {
+    BridgeApp* app = ctx;
+    if(app->ir_worker == NULL) return;
+    infrared_worker_tx_stop(app->ir_worker); /* waits out in-flight signal */
+    infrared_worker_free(app->ir_worker);
+    app->ir_worker = NULL;
+}
+
 /* Semantic validation of a GPIO REQUEST (claim state read under the
  * executor mutex). On success, `out` carries the job params with the
  * output hold folded into an absolute deadline tick. */
@@ -579,6 +626,18 @@ static MbStatus bridge_ir_validate_req(MbFrame* frame, MbIrParams* out) {
     return mb_ir_validate_params(out, &v) ? MB_OK : v;
 }
 
+static MbStatus bridge_ir_tx_validate_req(MbFrame* frame, MbIrTxParams* out) {
+    *out = (MbIrTxParams){0};
+    if(frame->length != 15) return MB_INVALID_ARGUMENT;
+    out->protocol = mb_u16(frame->payload);
+    out->address = mb_u32(frame->payload + 2);
+    out->command = mb_u32(frame->payload + 6);
+    out->frame_count = frame->payload[10];
+    out->timeout_ms = mb_u32(frame->payload + 11);
+    MbStatus v;
+    return mb_ir_tx_validate_params(out, &v) ? MB_OK : v;
+}
+
 static MbStatus bridge_adc_validate_req(BridgeApp* app, MbFrame* frame, MbAdcParams* out) {
     *out = (MbAdcParams){0};
     if(frame->length != 2) return MB_INVALID_ARGUMENT;
@@ -652,6 +711,15 @@ static size_t bridge_gpio_result(BridgeApp* app, uint16_t op, MbStatus status, u
         w += 4;
         break;
     }
+    case MB_IR_OP_TX_DECODED: {
+        MbIrTxSummary sum;
+        mb_ir_tx_last_summary(&sum);
+        mb_put_u32(out + w, sum.supplied);
+        w += 4;
+        mb_put_u32(out + w, sum.sent);
+        w += 4;
+        break;
+    }
     default:
         break;
     }
@@ -671,10 +739,13 @@ static void bridge_handle_request(BridgeApp* app, MbFrame* frame) {
     MbAdcParams adc = {0};
     MbNotifyParams notify = {0};
     MbIrParams ir = {0};
+    MbIrTxParams irtx = {0};
     bool is_gpio = frame->op >= MB_GPIO_OP_CONFIG && frame->op <= MB_GPIO_OP_RELEASE;
     bool is_adc = frame->op == MB_ADC_OP_READ;
     bool is_notify = frame->op == MB_NOTIFY_OP;
     bool is_ir = frame->op == MB_IR_OP_RX_START;
+    bool is_ir_tx = frame->op == MB_IR_OP_TX_DECODED;
+#if !MB_RELEASE_BUILD
     if(frame->op == BRIDGE_OP_FAKE_RUN) {
         if(frame->length != 6) {
             rejection = MB_INVALID_ARGUMENT;
@@ -687,7 +758,9 @@ static void bridge_handle_request(BridgeApp* app, MbFrame* frame) {
                 duration_ms = 10000; /* documented default (plan 6.5) */
             }
         }
-    } else if(is_gpio) {
+    } else
+#endif
+        if(is_gpio) {
         rejection = bridge_gpio_validate(app, frame, &gpio);
     } else if(is_adc) {
         rejection = bridge_adc_validate_req(app, frame, &adc);
@@ -695,6 +768,8 @@ static void bridge_handle_request(BridgeApp* app, MbFrame* frame) {
         rejection = bridge_notify_validate_req(frame, &notify);
     } else if(is_ir) {
         rejection = bridge_ir_validate_req(frame, &ir);
+    } else if(is_ir_tx) {
+        rejection = bridge_ir_tx_validate_req(frame, &irtx);
     } else {
         rejection = MB_UNSUPPORTED;
     }
@@ -782,6 +857,16 @@ static void bridge_handle_request(BridgeApp* app, MbFrame* frame) {
         app->ir_params = ir;
         module = &mb_module_ir;
         params = &app->ir_params;
+    } else if(is_ir_tx) {
+        /* Finite transmission; same deadline shape as IR RX: the
+         * module's own timeout, plus the 5 s wedge guard. */
+        uint32_t dur = 0, grace = 0;
+        mb_ticks_from_ms(irtx.timeout_ms, hz, &dur);
+        mb_ticks_from_ms(5000, hz, &grace);
+        deadline = dur + grace;
+        app->ir_tx_params = irtx;
+        module = &mb_module_ir_tx;
+        params = &app->ir_tx_params;
     } else {
         uint32_t dur_ticks = 0, int_ticks = 0, grace = 0;
         mb_ticks_from_ms(duration_ms, hz, &dur_ticks);
@@ -879,8 +964,13 @@ static void bridge_handle_frame(BridgeApp* app, const uint8_t* encoded, size_t e
         resp[w++] = 1; /* item_count */
         resp[w++] = 1; /* protocol major */
         resp[w++] = 0; /* protocol minor */
+#if MB_RELEASE_BUILD
+        resp[w++] = 1; /* app major: release 1.0 */
+        resp[w++] = 0; /* app minor */
+#else
         resp[w++] = 0; /* app major */
-        resp[w++] = 9; /* app minor: ...8=C11, 9=C12 ir rx */
+        resp[w++] = 10; /* app minor: ...9=C12 ir rx, 10=C13 ir tx */
+#endif
         mb_put_u16(resp + w, 87);
         w += 2; /* fw_api_major the SDK was built against */
         mb_put_u16(resp + w, 1);
@@ -924,7 +1014,10 @@ static void bridge_handle_frame(BridgeApp* app, const uint8_t* encoded, size_t e
             {MB_ADC_OP_READ, 1, MB_ADC_SAMPLES_MAX}, /* limit = max samples */
             {MB_NOTIFY_OP, 1, MB_NOTIFY_MAX_EFFECT_MS}, /* limit = max effect ms */
             {MB_IR_OP_RX_START, 1, MB_IR_MAX_TIMEOUT_MS}, /* limit = max timeout ms */
+            {MB_IR_OP_TX_DECODED, 1, MB_IR_MAX_TIMEOUT_MS}, /* limit = max timeout ms */
+#if !MB_RELEASE_BUILD
             {BRIDGE_OP_FAKE_RUN, 1, 60000},
+#endif
         };
         const uint32_t cap_count = sizeof(caps) / sizeof(caps[0]);
         uint32_t cursor = mb_u16(frame.payload);
@@ -1181,6 +1274,8 @@ static void bridge_write_result(BridgeApp* app) {
         for(uint32_t i = 0; i < tn && i < 4; i++) ev[i] = tail[i].event_code;
         MbIrSummary irs;
         mb_ir_last_summary(&irs);
+        MbIrTxSummary irtxs;
+        mb_ir_tx_last_summary(&irtxs);
         int len = snprintf(
             buf,
             sizeof(buf),
@@ -1189,6 +1284,7 @@ static void bridge_write_result(BridgeApp* app) {
             "exec_starts=%lu exec_terminals=%lu fake_exec=%lu fake_terminals=%lu fake_status=%lu "
             "cancels=%lu gpio_cfg=%lu gpio_wr=%lu gpio_rd=%lu gpio_rel=%lu gpio_exp=%lu gpio_claims=%lu "
             "adc_rd=%lu adc_smp=%lu ntfy=%lu ir_dec=%lu ir_emit=%lu ir_drop=%lu "
+            "ir_tx_sup=%lu ir_tx_sent=%lu "
             "data_gen=%lu data_enq=%lu data_drop=%lu data_consumed=%lu exec_beats=%lu "
             "heap_sf=%lu heap_smin=%lu heap_sblk=%lu heap_ef=%lu heap_emin=%lu heap_eblk=%lu "
             "rx_bytes_1s=%lu rx_errors_1s=%lu "
@@ -1222,6 +1318,8 @@ static void bridge_write_result(BridgeApp* app) {
             (unsigned long)irs.decoded,
             (unsigned long)irs.emitted,
             (unsigned long)irs.dropped,
+            (unsigned long)irtxs.supplied,
+            (unsigned long)irtxs.sent,
             (unsigned long)app->exec.generated,
             (unsigned long)app->exec.enqueued,
             (unsigned long)app->exec.dropped,
@@ -1265,7 +1363,7 @@ int32_t muse_bridge_app(void* context) {
     mb_diag_init(&app->diag);
     bridge_trace(app, MB_EV_APP_START, 0, 0);
 
-    /* C06 session with the design's fixed timing defaults. */
+    /* C06 session with the plan's fixed timing defaults. */
     {
         uint32_t hz = furi_kernel_get_tick_frequency();
         MbSessionConfig scfg = {0};
@@ -1320,7 +1418,11 @@ int32_t muse_bridge_app(void* context) {
     app->notify_hal = (MbNotifyHal){.play = bridge_notify_play, .ctx = app};
     mb_notify_module_bind(&app->notify_state, &app->notify_hal);
     app->ir_hal = (MbIrHal){
-        .rx_start = bridge_ir_rx_start, .rx_stop = bridge_ir_rx_stop, .ctx = app};
+        .rx_start = bridge_ir_rx_start,
+        .rx_stop = bridge_ir_rx_stop,
+        .tx_start = bridge_ir_tx_start,
+        .tx_stop = bridge_ir_tx_stop,
+        .ctx = app};
     mb_ir_module_bind(&app->ir_hal);
     app->notification = furi_record_open(RECORD_NOTIFICATION);
     app->exec_thread = furi_thread_alloc_ex("MbExec", 2048, bridge_exec_thread, app);
@@ -1498,7 +1600,9 @@ int32_t muse_bridge_app(void* context) {
             app->rx_errors_1s = app->rx_errors;
             app->rx_snap_taken = true;
         }
+#if !MB_RELEASE_BUILD
         if(elapsed_ms > BRIDGE_AUTO_EXIT_MS) break;
+#endif
         furi_delay_ms(20);
     }
 

@@ -1,5 +1,5 @@
 #pragma once
-/* Muse Bridge stable internal types (§4/§9).
+/* Muse Bridge stable internal types (plan §4/§9).
  * Portable C11; the module lifecycle below is the project API every
  * hardware module implements (§4), faked by modules/module_fake.c
  * until real hardware modules qualify. */

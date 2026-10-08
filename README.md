@@ -81,16 +81,18 @@ advertised capability list. Release history: [CHANGELOG.md](CHANGELOG.md).
 - [x] Analog voltage reads (multi-sample averaged)
 - [x] Finite notifications: LED flash, beep, vibration
 - [x] Infrared receive: decoded signals with sequenced event streams
+- [x] Infrared transmit: one finite decoded frame per action,
+      exactly-once proven by an independent bench receiver
+- [x] **P1-A release qualification (bridge 1.0)**: full link
+      fault-injection matrix, 100-cycle endurance per module,
+      30-minute receive soak with injected link drops, release build
+      with the development test operation removed
 
 **Next**
 
-- [ ] One verified finite IR transmission (needs a bench IR receiver
-      fixture to independently confirm exactly one frame)
-- [ ] Release qualification: endurance cycles, long fault soak,
-      release build, pinned build artifact
+- [ ] Raw IR capture/transfer objects (bounded timings)
 - [ ] NFC discovery and card identification
 - [ ] LF RFID read
-- [ ] iButton read
 - [ ] Sub-GHz receive: signal strength, then one decoded format
 - [ ] Scoped file storage transfers
 
@@ -103,7 +105,7 @@ advertised capability list. Release history: [CHANGELOG.md](CHANGELOG.md).
 
 **Optional, individually gated**
 
-- [ ] IR raw capture/replay objects
+- [ ] iButton read
 - [ ] NFC / LF RFID / iButton emulation — one combination at a time,
       each proven against an independent reader and each behind
       explicit human confirmation

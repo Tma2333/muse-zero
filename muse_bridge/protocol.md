@@ -1,4 +1,4 @@
-# Muse Bridge wire protocol (implemented subset: C04–C11)
+# Muse Bridge wire protocol (implemented subset: C04–C13)
 
 Status: implemented through checkpoint C04 (bootstrap only). Sessions,
 the action ledger, and all hardware operations arrive in C05+; nothing
@@ -12,7 +12,7 @@ below implies they exist yet.
   Decoded frame ≤ 512 B; payload ≤ 384 B. Partial frames older than
   250 ms are discarded through the next delimiter (never spliced).
 
-## Envelope (60-byte header, little-endian; §6.5)
+## Envelope (60-byte header, little-endian; plan §6.5)
 
 | Offset | Field |
 | --- | --- |
@@ -271,3 +271,40 @@ counted. The retained COMPLETE summary is
 `status:u16, decoded:u32, emitted:u32, dropped:u32` with
 decoded == emitted + dropped always: drops are accounted, never
 silent (decode ring full, pool full, or frames stranded at job end).
+
+## IR transmit, decoded (C13, op 0x0402)
+
+REQUEST `protocol:u16, address:u32, command:u32, frame_count:u8,
+timeout_ms:u32` (15 bytes). Initial qualification is deliberately
+narrow: protocol 1 (NEC), frame_count exactly 1, standard NEC field
+widths (address and command each ≤ 0xFF), timeout 1–60000 ms. Every
+other combination is a consumed INVALID_ARGUMENT and nothing reaches
+the LED.
+
+The job drives the firmware IR worker with a finite provider: the
+frame is supplied exactly once (worker response New, repeat=false),
+then the provider reports Stop on every subsequent call, including
+worker prefetch — the steady-signal Same response is never used, so
+the worker cannot loop the frame. Provider exhaustion, the worker's
+message-sent callback, and executor stop/join are distinct states:
+the job completes OK when the provider is exhausted (frame fully
+encoded into the worker's stream), and the retained terminal is
+recorded only after cleanup's TX stop has waited out any in-flight
+signal and joined the worker (emitter quiescent). The platform's
+message-sent callback never fires for a lone frame (the 1.4.3 worker
+spends NEC's minimum repeat count of 1 on the first message, which
+raises no sent event), so it is not the completion trigger; if the
+worker never finishes asking, the job's own timeout ends it with
+TIMEOUT instead of a fabricated success. The retained COMPLETE
+summary is `status:u16, supplied:u32, sent:u32`: frames handed to
+the worker, and frames confirmed physically complete — for a job
+that finished via exhaustion, the quiescing join in cleanup confirms
+every supplied frame; on timeout/stop paths the raw callback count
+stands.
+
+Exactly-once is end-to-end: resending an admitted action ID replays
+the retained COMPLETE from the ledger and emits nothing; a genuinely
+new action ID can transmit again after cleanup. Physical proof is a
+separate channel: an independent receiver (Pi GPIO + VS1838,
+`tools/witness_ir.py`) counts the frames that actually left the LED,
+and the C13 gate compares that count against the admissions.

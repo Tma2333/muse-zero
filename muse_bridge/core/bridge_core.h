@@ -1,7 +1,7 @@
 /* Muse Bridge portable reference core (plan section 21, extracted).
  * Single-header pattern: define MB_CORE_IMPLEMENTATION in exactly
  * one translation unit (core/bridge_core.c) before including this
- * header. Bodies are the design's verbatim reference implementation. */
+ * header. Bodies are the plan's verbatim reference implementation. */
 #pragma once
 
 /* Muse Bridge portable reference core: C11, no Furi dependency. */

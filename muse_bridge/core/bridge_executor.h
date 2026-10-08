@@ -1,5 +1,5 @@
 #pragma once
-/* Muse Bridge hardware executor (§5.1, §9).
+/* Muse Bridge hardware executor (plan §5.1, §9).
  * Sole owner of the module lifecycle for the one exclusive job slot
  * (§9.2). Driven by its owning thread calling mb_executor_service();
  * the controller admits jobs, requests stops through an independent

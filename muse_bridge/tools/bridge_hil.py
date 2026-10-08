@@ -6,6 +6,7 @@ The bridge FAP must already be running (it owns /dev/ttyAMA0).
 Prints PASS/FAIL per check and exits nonzero on any failure.
 """
 import argparse
+import os
 import struct
 import sys
 import threading
@@ -1704,6 +1705,455 @@ def case_c12x(link):
         echo.stop()
 
 
+OP_IR_TX_DECODED = 0x0402
+
+
+def tx_payload(protocol, address, command, frame_count, timeout_ms):
+    return struct.pack("<HIIBI", protocol, address, command,
+                       frame_count, timeout_ms)
+
+
+def tx_summary(f):
+    """COMPLETE payload: status:u16 + supplied:u32 + sent:u32."""
+    if f is None or len(f.payload) < 10:
+        return None
+    return struct.unpack_from("<HII", f.payload, 0)
+
+
+def case_c13(link):
+    """C13: one finite NEC transmission + lost-reply proof. An
+    independent Pi-side receiver (tools/witness_ir.py on GPIO27)
+    counts physical frames: exactly one per admitted action, zero for
+    the replayed duplicate, zero during the link-expiry window."""
+    import json
+    import os
+    import subprocess
+
+    seq = [0]
+
+    def next_seq():
+        seq[0] += 1
+        return seq[0]
+
+    nonce = (0xC13DEC01).to_bytes(16, "little")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    wit = None
+    try:
+        check("c13_session", ident is not None, repr(ident))
+        if ident is None:
+            return
+
+        link.send_id(ZERO16, ZERO16, 0, bc.T_QUERY,
+                     OP_GET_CAPABILITIES_C12, 990, struct.pack("<H", 0))
+        caps = link.wait_frame(990, timeout=5.0)
+        by_op = {}
+        if caps is not None:
+            body = caps.payload[4:]
+            for i in range(len(body) // 7):
+                o, k, lim = struct.unpack_from("<HBI", body, i * 7)
+                by_op[o] = (k, lim)
+        check("caps_ir_tx", by_op.get(OP_IR_TX_DECODED) == (1, 60000),
+              repr(by_op.get(OP_IR_TX_DECODED)))
+
+        def tx(address, command, s=None, protocol=1, frame_count=1,
+               timeout_ms=5000):
+            s = s or next_seq()
+            send_req(link, ident, s,
+                     tx_payload(protocol, address, command, frame_count,
+                                timeout_ms),
+                     op=OP_IR_TX_DECODED)
+            return s
+
+        # Rejection matrix: every row a consumed INVALID_ARGUMENT,
+        # never an ACCEPTED (nothing may reach the LED).
+        for name, kw in (
+                ("tx_fc0", dict(frame_count=0)),
+                ("tx_fc2", dict(frame_count=2)),
+                ("tx_addr_wide", dict(address=0x100)),
+                ("tx_cmd_wide", dict(command=0x100)),
+                ("tx_proto2", dict(protocol=2)),
+                ("tx_timeout0", dict(timeout_ms=0)),
+                ("tx_timeout60001", dict(timeout_ms=60001))):
+            kw.setdefault("address", 0x04)
+            kw.setdefault("command", 0x08)
+            s = tx(**kw)
+            f = action_outcome(link, s)
+            check(name, f is not None and f.status == S_INVAL
+                  and f.type != 10, repr(f))
+
+        # Arm the independent witness, then transmit.
+        out_path = "/tmp/witness_c13.json"
+        try:
+            os.unlink(out_path)
+        except FileNotFoundError:
+            pass
+        wit = subprocess.Popen(
+            ["/usr/bin/python3" if os.path.exists("/usr/bin/python3")
+             else sys.executable,
+             os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "witness_ir.py"),
+             "--seconds", "34", "--out", out_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        time.sleep(2.0)  # witness armed before the first frame
+
+        # Action A: exactly one NEC frame addr 4 cmd 8.
+        sa = tx(0x04, 0x08)
+        comp = action_outcome(link, sa, timeout=8.0)
+        summ = tx_summary(comp)
+        check("tx_a_complete", comp is not None and comp.type == 12
+              and result_status(comp) == S_OK, repr(comp))
+        check("tx_a_summary", summ is not None and summ[1] == 1
+              and summ[2] == 1, repr(summ))
+
+        # Lost-reply proof: retry the same action ID verbatim. The
+        # ledger replays the retained COMPLETE; no second emission.
+        send_req(link, ident, sa, tx_payload(1, 0x04, 0x08, 1, 5000),
+                 op=OP_IR_TX_DECODED)
+        rep = link.wait_frame(sa, timeout=5.0)
+        check("tx_a_replay", rep is not None and rep.type == 12
+              and result_status(rep) == S_OK
+              and tx_summary(rep) == summ, repr(rep))
+
+        # Action B: a genuinely new ID transmits again after cleanup.
+        sb = tx(0x04, 0x08)
+        comp = action_outcome(link, sb, timeout=8.0)
+        summ = tx_summary(comp)
+        check("tx_b_complete", comp is not None and comp.type == 12
+              and result_status(comp) == S_OK and summ is not None
+              and summ[1] == 1 and summ[2] == 1, repr(comp))
+
+        # Link expiry + resume: reconciliation finds action A terminal
+        # and the emitter stays silent through the whole window.
+        echo.paused = True
+        time.sleep(6.0)
+        echo.paused = False
+        ident2 = resume_session(link, ident,
+                                (0xC13DEC02).to_bytes(16, "little"))
+        check("tx_resumed", ident2 is not None, repr(ident2))
+        if ident2 is not None:
+            gr = get_result(link, 950, ident2, sa)
+            term_status = None
+            if gr is not None and len(gr.payload) >= 4:
+                term_status = struct.unpack_from("<H", gr.payload, 2)[0]
+            check("tx_a_get_result", term_status == S_OK, repr(gr))
+
+        # Physical verdict from the independent receiver.
+        try:
+            wout, _ = wit.communicate(timeout=45)
+        except subprocess.TimeoutExpired:
+            wit.kill()
+            wout, _ = wit.communicate()
+        wit = None
+        verdict = None
+        try:
+            with open(out_path) as fh:
+                verdict = json.load(fh)
+        except (OSError, ValueError):
+            pass
+        frames = verdict["frames"] if verdict else []
+        data = [f for f in frames if f["kind"] == "data"]
+        reps = [f for f in frames if f["kind"] == "repeat"]
+        check("witness_heard", verdict is not None and verdict["edges"] > 0,
+              (repr(verdict) if verdict else (wout or ""))[:300])
+        check("witness_exactly_two_frames", len(data) == 2
+              and all(f["addr"] == 0x04 and f["cmd"] == 0x08 for f in data),
+              repr(frames))
+        check("witness_no_repeats", len(reps) == 0, repr(frames))
+    finally:
+        if wit is not None:
+            wit.kill()
+        echo.stop()
+
+
+def case_c14l(link):
+    """C14L (L02 on a real module): drop the ACCEPTED of a running IR
+    RX job, retry the identical request — the firmware replays
+    ACCEPTED for the SAME job (no second worker, no second start),
+    and the job still reaches exactly one terminal."""
+    seq = [0]
+
+    def next_seq():
+        seq[0] += 1
+        return seq[0]
+
+    nonce = (0xC14DEC01).to_bytes(16, "little")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    try:
+        check("c14l_session", ident is not None, repr(ident))
+        if ident is None:
+            return
+        s = next_seq()
+        payload = struct.pack("<HI", 1, 20000)
+        send_req(link, ident, s, payload, op=OP_IR_RX_START)
+        time.sleep(0.6)  # ACCEPTED arrives unread: "dropped"
+        link.pop_all(10, correlation=s)  # discard whatever queued
+        send_req(link, ident, s, payload, op=OP_IR_RX_START)  # retry
+        acc = link.wait_type(10, correlation=s, timeout=4.0)
+        check("l02_replay_accepted", acc is not None, repr(acc))
+        r = send_cancel(link, ident, 900, s)
+        check("l02_cancel_ack", r is not None and r.status == 1, repr(r))
+        evs, comp = rx_collect(link, s, timeout=6.0)
+        check("l02_single_terminal", comp is not None
+              and result_status(comp) == S_CANCELLED_C12, repr(comp))
+        summ = ir_summary(comp)
+        check("l02_summary_sane", summ is not None and summ[1] == 0,
+              repr(summ))
+    finally:
+        echo.stop()
+
+
+def case_c14_cycles(link, module):
+    """C14 lifecycle: 100 start/stop cycles of one module inside a
+    single launch. Heap drift is judged from result.txt afterwards
+    (heap_sf vs heap_ef written at this launch's exit)."""
+    seq = [0]
+
+    def next_seq():
+        seq[0] += 1
+        return seq[0]
+
+    nonce = (0xC14C7C01).to_bytes(16, "little")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    ok_count = [0]
+    try:
+        check(f"cyc_{module}_session", ident is not None, repr(ident))
+        if ident is None:
+            return
+
+        def run(payload, op):
+            s = next_seq()
+            send_req(link, ident, s, payload, op=op)
+            f = action_outcome(link, s, timeout=8.0)
+            if f is not None and f.type == 12 and result_status(f) == S_OK:
+                ok_count[0] += 1
+                return True
+            print(f"cycle failure at {ok_count[0]}: {f!r}", flush=True)
+            return False
+
+        if module == "gpio":
+            for _ in range(100):
+                if not run(gpio_config_payload(2, 1, 0, 0, 0),
+                           OP_GPIO_CONFIG):
+                    break
+                if not run(bytes([2]), OP_GPIO_RELEASE):
+                    break
+        elif module == "adc":
+            for _ in range(100):
+                if not run(struct.pack("<BB", 2, 4), OP_ADC_READ):
+                    break
+        elif module == "notify":
+            for _ in range(100):
+                if not run(bytes([1]), OP_NOTIFY):
+                    break
+        elif module == "irrx":
+            for _ in range(100):
+                s = next_seq()
+                send_req(link, ident, s, struct.pack("<HI", 1, 300),
+                         op=OP_IR_RX_START)
+                evs, comp = rx_collect(link, s, timeout=8.0)
+                if comp is not None and result_status(comp) == S_OK \
+                        and evs == []:
+                    ok_count[0] += 1
+                else:
+                    print(f"cycle failure at {ok_count[0]}: {comp!r}",
+                          flush=True)
+                    break
+        want = 200 if module == "gpio" else 100  # gpio cycle = 2 actions
+        check(f"cyc_{module}_100", ok_count[0] == want,
+              f"ok={ok_count[0]}")
+    finally:
+        echo.stop()
+
+
+def case_c14_soak(link):
+    """C14 soak: 30 minutes of continuous IR receive. Normal jobs run
+    the full 60 s window; every 5th job takes an injected 6 s link
+    pause mid-flight (lease expiry -> LINK_LOST), then the session
+    resumes and work continues. PING round-trip is sampled each job.
+    Progress lines go to stdout for the detached runner's log."""
+    seq = [0]
+
+    def next_seq():
+        seq[0] += 1
+        return seq[0]
+
+    nonce = (0xC1450A01).to_bytes(16, "little")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    t_start = time.monotonic()
+    jobs_ok = jobs_lost = jobs_bad = pings = 0
+    ping_ms = []
+    try:
+        check("soak_session", ident is not None, repr(ident))
+        if ident is None:
+            return
+        job_no = 0
+        while time.monotonic() - t_start < 1800:
+            job_no += 1
+            # PING latency sample (bootstrap query, no session state).
+            t0 = time.monotonic()
+            link.send_id(ZERO16, ZERO16, 0, bc.T_QUERY, bc.OP_PING, 990,
+                         b"\x00\x00")
+            pf = link.wait_frame(990, timeout=3.0)
+            if pf is not None:
+                pings += 1
+                ping_ms.append((time.monotonic() - t0) * 1000.0)
+            s = next_seq()
+            send_req(link, ident, s, struct.pack("<HI", 1, 60000),
+                     op=OP_IR_RX_START)
+            if job_no % 5 == 0:
+                acc = link.wait_type(10, correlation=s, timeout=4.0)
+                time.sleep(20.0)
+                echo.paused = True
+                time.sleep(6.0)
+                echo.paused = False
+                ident2 = resume_session(
+                    link, ident, (0xC1450A02 + job_no).to_bytes(16, "little"))
+                if ident2 is None:
+                    jobs_bad += 1
+                    print(f"soak job {job_no}: RESUME FAILED", flush=True)
+                    break
+                ident = ident2
+                gr = get_result(link, 950, ident, s)
+                term = None
+                if gr is not None and len(gr.payload) >= 4:
+                    term = struct.unpack_from("<H", gr.payload, 2)[0]
+                if term == S_LINKLOST_C12:
+                    jobs_lost += 1
+                else:
+                    jobs_bad += 1
+                print(f"soak job {job_no}: injected expiry term={term} "
+                      f"elapsed={time.monotonic() - t_start:.0f}s",
+                      flush=True)
+            else:
+                evs, comp = rx_collect(link, s, timeout=75.0)
+                if comp is not None and result_status(comp) == S_OK:
+                    jobs_ok += 1
+                else:
+                    jobs_bad += 1
+                    print(f"soak job {job_no}: BAD {comp!r}", flush=True)
+                print(f"soak job {job_no}: ok elapsed="
+                      f"{time.monotonic() - t_start:.0f}s", flush=True)
+        check("soak_jobs_ok", jobs_ok >= 20, f"ok={jobs_ok}")
+        check("soak_injected_recovered", jobs_lost >= 4 and jobs_bad == 0,
+              f"lost={jobs_lost} bad={jobs_bad}")
+        if ping_ms:
+            print(f"soak ping: n={len(ping_ms)} min={min(ping_ms):.1f}ms "
+                  f"max={max(ping_ms):.1f}ms "
+                  f"avg={sum(ping_ms) / len(ping_ms):.1f}ms", flush=True)
+        check("soak_pings", pings >= 20, f"pings={pings}")
+    finally:
+        echo.stop()
+
+
+def case_c14t(link):
+    """C14 TX lifecycle: 100 finite NEC transmissions on one launch.
+    The independent witness (started externally, see evidence) must
+    count exactly 100 data frames and 0 repeats."""
+    seq = [0]
+
+    def next_seq():
+        seq[0] += 1
+        return seq[0]
+
+    nonce = (0xC14DEC13).to_bytes(16, "little")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    ok = 0
+    try:
+        check("c14t_session", ident is not None, repr(ident))
+        if ident is None:
+            return
+        for _ in range(100):
+            s = next_seq()
+            send_req(link, ident, s, tx_payload(1, 0x04, 0x08, 1, 5000),
+                     op=OP_IR_TX_DECODED)
+            comp = action_outcome(link, s, timeout=8.0)
+            summ = tx_summary(comp)
+            if comp is not None and result_status(comp) == S_OK \
+                    and summ is not None and summ[1] == 1 and summ[2] == 1:
+                ok += 1
+            else:
+                print(f"tx cycle failure at {ok}: {comp!r}", flush=True)
+                break
+        check("c14t_100", ok == 100, f"ok={ok}")
+    finally:
+        echo.stop()
+
+
+def case_c14_l21a(link):
+    """L21 phase A: admit one IR TX, deliberately never read its
+    COMPLETE (the 'reply' is dropped), then wait while the human
+    presses Back to restart the FAP. Phase B runs on the new boot."""
+    seq = [0]
+
+    def next_seq():
+        seq[0] += 1
+        return seq[0]
+
+    nonce = (0xC14DEC21).to_bytes(16, "little")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    try:
+        check("l21a_session", ident is not None, repr(ident))
+        if ident is None:
+            return
+        s = next_seq()
+        send_req(link, ident, s, tx_payload(1, 0x04, 0x08, 1, 5000),
+                 op=OP_IR_TX_DECODED)
+        acc = link.wait_type(10, correlation=s, timeout=4.0)
+        check("l21a_accepted", acc is not None, repr(acc))
+        with open("/tmp/l21_seq.txt", "w") as fh:
+            fh.write(str(s))
+        print("L21: press Back on the Flipper ONCE now", flush=True)
+        time.sleep(15.0)  # human exits the app; COMPLETE stays unread
+    finally:
+        echo.stop()
+
+
+def case_c14_l21b(link):
+    """L21 phase B (new boot): the old action must not be replayed or
+    auto-retried; GET_RESULT for it reports OUTCOME_UNAVAILABLE, and
+    the client records the outcome as indeterminate."""
+    try:
+        with open("/tmp/l21_seq.txt") as fh:
+            old_seq = int(fh.read().strip())
+    except (OSError, ValueError):
+        old_seq = 1
+    nonce = (0xC14DEC22).to_bytes(16, "little")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    try:
+        check("l21b_session_new_boot", ident is not None, repr(ident))
+        if ident is None:
+            return
+        # Recovery path (zero envelope): the new boot simply has no
+        # record of the old action — present=0 in the reply payload.
+        gr = get_result(link, 950, ident, old_seq)
+        check("l21b_not_present_new_boot",
+              gr is not None and len(gr.payload) >= 1
+              and gr.payload[0] == 0, repr(gr))
+        # Identity path: a query carrying a foreign identity is
+        # refused OUTCOME_UNAVAILABLE in the frame header.
+        link.send_id(b"\xaa" * 16, b"\xbb" * 16, 1, bc.T_QUERY,
+                     bc.OP_GET_RESULT, 951, struct.pack("<Q", old_seq))
+        f = link.wait_frame(951, timeout=4.0)
+        check("l21b_foreign_identity_23",
+              f is not None and f.status == 23, repr(f))
+    finally:
+        echo.stop()
+
+
 def case_c10b(link):
     """Manual proof: a claimed-high pin under a LIVE lease; the operator
     presses Back; the exit path restores the pin (observed on the Pi)."""
@@ -1766,6 +2216,26 @@ def main():
             case_c12(link)
         elif args.case == "C12X":
             case_c12x(link)
+        elif args.case == "C13":
+            case_c13(link)
+        elif args.case == "C14L":
+            case_c14l(link)
+        elif args.case == "C14G":
+            case_c14_cycles(link, "gpio")
+        elif args.case == "C14A":
+            case_c14_cycles(link, "adc")
+        elif args.case == "C14N":
+            case_c14_cycles(link, "notify")
+        elif args.case == "C14R":
+            case_c14_cycles(link, "irrx")
+        elif args.case == "SOAK":
+            case_c14_soak(link)
+        elif args.case == "C14T":
+            case_c14t(link)
+        elif args.case == "C14L21A":
+            case_c14_l21a(link)
+        elif args.case == "C14L21B":
+            case_c14_l21b(link)
         else:
             print(f"unknown case {args.case}")
             return 2

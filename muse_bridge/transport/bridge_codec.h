@@ -1,6 +1,6 @@
 #pragma once
-/* Muse Bridge wire encoder helpers.
- * The decoder/collector live in core/bridge_core.h (extracted §21
+/* Muse Bridge wire encoder helpers (plan §6.5).
+ * The decoder/collector live in core/bridge_core.h (extracted plan §21
  * reference); this header adds the matching transmit side used by the
  * FAP, native tests and the golden-vector printer. */
 #include <stddef.h>

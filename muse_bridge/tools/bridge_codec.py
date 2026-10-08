@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Muse Bridge wire codec (Pi side) — mirror of transport/bridge_codec.c
-and the §21 reference core. COBS + CRC-32/ISO-HDLC + 60-byte envelope.
+and the plan §21 reference core. COBS + CRC-32/ISO-HDLC + 60-byte envelope.
 
 Run directly to print the golden vectors; they must match the C printer
 (tests/native/print_vectors.c) byte-for-byte.
@@ -203,6 +203,6 @@ if __name__ == "__main__":
     if "--vectors" in sys.argv:
         print_vectors()
     else:
-        # sanity: the golden CRC from the design's reference test
+        # sanity: the golden CRC from the plan's reference test
         assert crc32(b"123456789") == 0xCBF43926
         print("bridge_codec self-check OK (crc32 check value matches)")
