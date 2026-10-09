@@ -37,6 +37,15 @@ time can:
   complete on their own,
 - receive decoded infrared remote signals as an ordered,
   drop-accounted event stream,
+- transmit exactly one finite infrared frame per action — decoded
+  (NEC) or raw timings — exactly-once proven by an independent
+  bench receiver,
+- capture a raw infrared waveform into a bounded, CRC-checked
+  object, read it back in pages, and replay it the same finite
+  way; partially transferred objects can never transmit,
+- hear and see listening state from the device itself: a double
+  beep opens and closes every listening period and the LED
+  flashes while it lasts,
 - ask what actually happened: cancellation, absolute deadlines, and a
   diagnostic trace readable over the wire.
 
@@ -46,7 +55,7 @@ after cancellation, link loss, or an app restart.
 
 ## What it deliberately doesn't do
 
-No transmissions (IR/Sub-GHz), no NFC/RFID emulation, no tag writing.
+No Sub-GHz transmission, no NFC/RFID emulation, no tag writing.
 Those arrive one at a time, each proven against an independent
 receiver and gated behind explicit human approval; the advertised
 capability list (`GET_CAPABILITIES` in the protocol) only ever names

@@ -1867,6 +1867,670 @@ def case_c13(link):
         echo.stop()
 
 
+OP_RX_RAW, OP_TX_RAW = 0x0410, 0x0411
+OP_OBJ_BEGIN, OP_OBJ_CHUNK, OP_OBJ_COMMIT = 0x0901, 0x0902, 0x0903
+OP_OBJ_READ_Q, OP_OBJ_RELEASE = 0x0904, 0x0905
+S_OVERFLOW_C15 = 17
+
+
+def nec_waveform(addr=0x04, cmd=0x08):
+    """NEC pulse-distance timings (us): leader + 4 bytes LSB-first
+    (addr, ~addr, cmd, ~cmd) + final mark. 67 timings."""
+    ts = [9000, 4500]
+    for byte in (addr, addr ^ 0xFF, cmd, cmd ^ 0xFF):
+        for i in range(8):
+            ts.append(560)
+            ts.append(1690 if (byte >> i) & 1 else 560)
+    ts.append(560)
+    return ts
+
+
+def timings_crc(ts):
+    import zlib
+    return zlib.crc32(b"".join(struct.pack("<I", v) for v in ts)) & 0xFFFFFFFF
+
+
+def nec_decode(ts):
+    """Decode NEC from raw timings with +-35% tolerance. Returns
+    (addr, cmd) or None."""
+    def near(v, target):
+        return abs(v - target) <= target * 0.35
+    if len(ts) < 2 or not near(ts[0], 9000) or not near(ts[1], 4500):
+        return None
+    bits = []
+    i = 2
+    while i + 1 < len(ts) + 1 and len(bits) < 32:
+        if i >= len(ts):
+            break
+        mark = ts[i]
+        if not near(mark, 560):
+            return None
+        if i + 1 >= len(ts):
+            break
+        space = ts[i + 1]
+        if near(space, 560):
+            bits.append(0)
+        elif near(space, 1690):
+            bits.append(1)
+        else:
+            return None
+        i += 2
+    if len(bits) < 32:
+        return None
+    out = []
+    for b in range(4):
+        v = 0
+        for j in range(8):
+            v |= bits[b * 8 + j] << j
+        out.append(v)
+    if out[1] != (out[0] ^ 0xFF) or out[3] != (out[2] ^ 0xFF):
+        return None
+    return (out[0], out[2])
+
+
+def obj_begin_pl(count, crc, carrier=38000, duty=330, swm=1, otype=1):
+    return (bytes([otype]) + struct.pack("<H", count)
+            + struct.pack("<I", carrier) + struct.pack("<H", duty)
+            + bytes([swm]) + struct.pack("<I", crc))
+
+
+def obj_chunk_pl(oid, offset, durations):
+    return (struct.pack("<Q", oid) + struct.pack("<H", offset)
+            + bytes([len(durations)])
+            + b"".join(struct.pack("<I", d) for d in durations))
+
+
+def obj_summary(f):
+    """Object action COMPLETE: status:u16, object_id:u64, crc:u32."""
+    if f is None or len(f.payload) < 14:
+        return None
+    return struct.unpack_from("<HQI", f.payload, 0)
+
+
+def rawrx_summary(f):
+    """RX_RAW COMPLETE: status:u16, object_id:u64, count:u16,
+    crc:u32, capture_complete:u8."""
+    if f is None or len(f.payload) < 17:
+        return None
+    return struct.unpack_from("<HQHIB", f.payload, 0)
+
+
+def obj_read(link, ident, corr, oid, offset, count):
+    link.send_id(ident[0], ident[1], ident[2], bc.T_QUERY, OP_OBJ_READ_Q,
+                 corr, struct.pack("<QHB", oid, offset, count))
+    return link.wait_frame(corr, timeout=5.0)
+
+
+def obj_read_parse(f):
+    """OBJECT_READ RESULT payload: present, complete, from_capture,
+    carrier_measured (u8 each), total:u16, returned:u8, crc:u32,
+    carrier:u32, duty:u16, starts_with_mark:u8, timings[returned]."""
+    if f is None or len(f.payload) < 18:
+        return None
+    present, complete, from_cap, measured = struct.unpack_from("<BBBB", f.payload, 0)
+    total, returned = struct.unpack_from("<HB", f.payload, 4)
+    crc, carrier = struct.unpack_from("<II", f.payload, 7)
+    duty, swm = struct.unpack_from("<HB", f.payload, 15)
+    ts = []
+    for i in range(returned):
+        ts.append(struct.unpack_from("<I", f.payload, 18 + 4 * i)[0])
+    return dict(present=present, complete=complete, from_capture=from_cap,
+                measured=measured, total=total, returned=returned, crc=crc,
+                carrier=carrier, duty=duty, swm=swm, timings=ts)
+
+
+def case_c15(link):
+    """C15: raw IR + bounded objects. Self-contained rows first
+    (upload/commit/read/refusals/empty capture), then a lease-expiry
+    purge row, then the bench rows under the resumed session: a real
+    remote capture (operator presses the NEC 4/8 remote repeatedly
+    during the capture windows) and two witness-judged raw TX trains
+    (captured object + synthetic uploaded object), exactly one NEC
+    frame each."""
+    import json
+    import os
+    import subprocess
+
+    seq = [0]
+
+    def next_seq():
+        seq[0] += 1
+        return seq[0]
+
+    nonce = (0xC15DEC01).to_bytes(16, "little")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    wit = None
+    try:
+        check("c15_session", ident is not None, repr(ident))
+        if ident is None:
+            return
+
+        # Build identity on the new firmware.
+        link.send_id(ZERO16, ZERO16, 0, bc.T_QUERY, 0x0002, 991, b"")
+        info = link.wait_frame(991, timeout=5.0)
+        check("c15_build", info is not None
+              and b"mb-0.12-c15-2" in info.payload,
+              repr(info.payload[:80]) if info else "no info")
+
+        # Capabilities across pages.
+        by_op = {}
+        cursor = 0
+        for _ in range(4):
+            link.send_id(ZERO16, ZERO16, 0, bc.T_QUERY,
+                         OP_GET_CAPABILITIES_C12, 990,
+                         struct.pack("<H", cursor))
+            caps = link.wait_frame(990, timeout=5.0)
+            if caps is None or len(caps.payload) < 4:
+                break
+            nxt = struct.unpack_from("<H", caps.payload, 1)[0]
+            body = caps.payload[4:]
+            for i in range(len(body) // 7):
+                o, k, lim = struct.unpack_from("<HBI", body, i * 7)
+                by_op[o] = (k, lim)
+            if nxt == 0xFFFF:
+                break
+            cursor = nxt
+        for op, want in ((OP_RX_RAW, (1, 60000)), (OP_TX_RAW, (1, 60000)),
+                         (OP_OBJ_BEGIN, (1, 512)), (OP_OBJ_CHUNK, (1, 64)),
+                         (OP_OBJ_COMMIT, (1, 0)), (OP_OBJ_READ_Q, (0, 32)),
+                         (OP_OBJ_RELEASE, (1, 0)),
+                         (OP_IR_TX_DECODED, (1, 60000))):
+            check(f"caps_{op:#06x}", by_op.get(op) == want,
+                  repr(by_op.get(op)))
+
+        wave = nec_waveform()
+        crc = timings_crc(wave)
+
+        def act(op, payload, s=None):
+            s = s or next_seq()
+            send_req(link, ident, s, payload, op=op)
+            return s
+
+        # Upload object 1 (the action sequence becomes the id).
+        s_begin = act(OP_OBJ_BEGIN, obj_begin_pl(len(wave), crc))
+        f = action_outcome(link, s_begin)
+        osum = obj_summary(f)
+        check("begin_ok", f is not None and f.type == 12
+              and result_status(f) == S_OK and osum is not None
+              and osum[1] == s_begin, repr(f))
+        s_c1 = act(OP_OBJ_CHUNK, obj_chunk_pl(s_begin, 0, wave[:64]))
+        f = action_outcome(link, s_c1)
+        check("chunk1_ok", f is not None and result_status(f) == S_OK,
+              repr(f))
+        # Same-seq replay of chunk 1: ledger replays its COMPLETE.
+        send_req(link, ident, s_c1, obj_chunk_pl(s_begin, 0, wave[:64]),
+                 op=OP_OBJ_CHUNK)
+        rep = link.wait_frame(s_c1, timeout=5.0)
+        check("chunk1_replay", rep is not None and rep.type == 12
+              and result_status(rep) == S_OK, repr(rep))
+        # Identical range under a fresh seq: acknowledged, no rewrite.
+        s = act(OP_OBJ_CHUNK, obj_chunk_pl(s_begin, 0, wave[:64]))
+        f = action_outcome(link, s)
+        check("chunk_identical_reack", f is not None
+              and result_status(f) == S_OK, repr(f))
+        # Conflicting range: admitted, terminal INVALID_ARGUMENT.
+        s = act(OP_OBJ_CHUNK, obj_chunk_pl(s_begin, 0, [1] * 64))
+        f = action_outcome(link, s)
+        check("chunk_conflict", f is not None and f.type == 12
+              and result_status(f) == S_INVAL, repr(f))
+        # TX of the not-yet-committed object: consumed refusal.
+        s = act(OP_TX_RAW, struct.pack("<Q", s_begin) + bytes([1])
+                + struct.pack("<I", 5000))
+        f = action_outcome(link, s)
+        check("tx_uncommitted_refused", f is not None and f.type != 10
+              and f.status == S_RES_UNAVAIL, repr(f))
+        s = act(OP_OBJ_CHUNK, obj_chunk_pl(s_begin, 64, wave[64:]))
+        f = action_outcome(link, s)
+        check("chunk2_ok", f is not None and result_status(f) == S_OK,
+              repr(f))
+        s = act(OP_OBJ_COMMIT, struct.pack("<Q", s_begin))
+        f = action_outcome(link, s)
+        osum = obj_summary(f)
+        check("commit_ok", f is not None and result_status(f) == S_OK
+              and osum is not None and osum[2] == crc, repr(f))
+
+        # Read object 1 back in pages: byte-exact.
+        got = []
+        hdr = None
+        for off in (0, 32, 64):
+            rf = obj_read(link, ident, 980 - off, s_begin, off, 32)
+            rp = obj_read_parse(rf)
+            if off == 0:
+                hdr = rp
+            if rp is not None:
+                got.extend(rp["timings"])
+        check("read_hdr", hdr is not None and hdr["present"] == 1
+              and hdr["complete"] == 1 and hdr["from_capture"] == 0
+              and hdr["measured"] == 0 and hdr["total"] == len(wave)
+              and hdr["crc"] == crc and hdr["carrier"] == 38000
+              and hdr["duty"] == 330 and hdr["swm"] == 1, repr(hdr))
+        check("read_exact", got == wave, f"{len(got)} timings")
+        rf = obj_read(link, ident, 970, s_begin, len(wave), 32)
+        rp = obj_read_parse(rf)
+        check("read_past_end", rp is not None and rp["returned"] == 0,
+              repr(rp))
+
+        # Partial upload: commit refuses, TX refuses, release frees.
+        t2 = [1000 + 10 * i for i in range(10)]
+        s2 = act(OP_OBJ_BEGIN, obj_begin_pl(len(t2), timings_crc(t2)))
+        f = action_outcome(link, s2)
+        check("begin2_ok", f is not None and result_status(f) == S_OK,
+              repr(f))
+        s = act(OP_OBJ_CHUNK, obj_chunk_pl(s2, 0, t2[:5]))
+        action_outcome(link, s)
+        s = act(OP_OBJ_COMMIT, struct.pack("<Q", s2))
+        f = action_outcome(link, s)
+        check("commit_hole_refused", f is not None and f.type == 12
+              and result_status(f) == S_INVAL, repr(f))
+        s = act(OP_TX_RAW, struct.pack("<Q", s2) + bytes([1])
+                + struct.pack("<I", 5000))
+        f = action_outcome(link, s)
+        check("tx_partial_refused", f is not None and f.type != 10
+              and f.status == S_RES_UNAVAIL, repr(f))
+        rf = obj_read(link, ident, 969, s2, 0, 32)
+        rp = obj_read_parse(rf)
+        check("read_inprogress", rp is not None and rp["present"] == 1
+              and rp["complete"] == 0 and rp["total"] == 10
+              and rp["returned"] == 5, repr(rp))
+        s = act(OP_OBJ_RELEASE, struct.pack("<Q", s2))
+        f = action_outcome(link, s)
+        check("release_ok", f is not None and result_status(f) == S_OK,
+              repr(f))
+        rf = obj_read(link, ident, 968, s2, 0, 32)
+        check("read_after_release", rf is not None
+              and rf.status == S_RES_UNAVAIL, repr(rf))
+
+        # BEGIN shape matrix: consumed INVALID_ARGUMENT rows.
+        for name, kw in (("begin_count513", dict(count=513)),
+                         ("begin_carrier", dict(carrier=36000)),
+                         ("begin_duty", dict(duty=300)),
+                         ("begin_swm0", dict(swm=0))):
+            kw.setdefault("count", 10)
+            kw.setdefault("crc", 0)
+            s = act(OP_OBJ_BEGIN, obj_begin_pl(**kw))
+            f = action_outcome(link, s)
+            check(name, f is not None and f.type != 10
+                  and f.status == S_INVAL, repr(f))
+
+        # Empty raw capture: an honest no-object completion. The
+        # operator is pressing on a ~3 s cadence by now, so retry up
+        # to 3 windows: a landed burst must be a well-formed complete
+        # capture (bonus coverage), a silent window proves the row.
+        empty_ok = False
+        for _try in range(3):
+            s = act(OP_RX_RAW, struct.pack("<I", 1200))
+            f = action_outcome(link, s, timeout=8.0)
+            rs = rawrx_summary(f)
+            if rs is not None and rs[1] == 0:
+                check("rxraw_empty", f is not None
+                      and result_status(f) == S_OK and rs[2] == 0
+                      and rs[4] == 0, repr(f))
+                empty_ok = True
+                break
+            if rs is not None and rs[4] == 1:
+                continue  # a press landed; try for a silent window
+            break
+        if not empty_ok and rs is not None and rs[1] != 0:
+            check("rxraw_empty", False,
+                  "all windows caught operator presses")
+
+        # Lease expiry mid-upload: the replacing session (resume)
+        # purges the previous owner's objects.
+        s3 = act(OP_OBJ_BEGIN, obj_begin_pl(len(wave), crc))
+        action_outcome(link, s3)
+        s = act(OP_OBJ_CHUNK, obj_chunk_pl(s3, 0, wave[:10]))
+        action_outcome(link, s)
+        echo.paused = True
+        time.sleep(6.0)
+        echo.paused = False
+        ident2 = resume_session(link, ident,
+                                (0xC15DEC02).to_bytes(16, "little"))
+        check("c15_resumed", ident2 is not None, repr(ident2))
+        if ident2 is None:
+            return
+        ident = ident2
+        time.sleep(0.5)  # let the device's purge pass run
+        rf = obj_read(link, ident, 967, s3, 0, 32)
+        check("purge_old_upload", rf is not None
+              and rf.status == S_RES_UNAVAIL, repr(rf))
+        rf = obj_read(link, ident, 966, s_begin, 0, 32)
+        check("purge_old_object", rf is not None
+              and rf.status == S_RES_UNAVAIL, repr(rf))
+
+        # ---- Bench rows (operator + witness) ----
+        out_path = "/tmp/witness_c15.json"
+        try:
+            os.unlink(out_path)
+        except FileNotFoundError:
+            pass
+        wit = subprocess.Popen(
+            ["/usr/bin/python3" if os.path.exists("/usr/bin/python3")
+             else sys.executable,
+             os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "witness_ir.py"),
+             "--seconds", "120", "--out", out_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        time.sleep(2.0)
+
+        # Real capture: up to 3 windows for the operator's presses.
+        cap = None
+        for attempt in range(3):
+            s = act(OP_RX_RAW, struct.pack("<I", 20000))
+            f = action_outcome(link, s, timeout=26.0)
+            rs = rawrx_summary(f)
+            if rs is not None and rs[1] != 0:
+                cap = (f, rs)
+                break
+        check("capture_landed", cap is not None,
+              "no burst in 3 windows")
+        if cap is not None:
+            f, rs = cap
+            check("capture_summary", result_status(f) == S_OK
+                  and rs[4] == 1 and 60 <= rs[2] <= 80 and rs[3] != 0,
+                  repr(rs))
+            cap_id = rs[1]
+            got = []
+            hdr = None
+            off = 0
+            while off < rs[2]:
+                rf = obj_read(link, ident, 960 - off, cap_id, off, 32)
+                rp = obj_read_parse(rf)
+                if rp is None or rp["returned"] == 0:
+                    break
+                if hdr is None:
+                    hdr = rp
+                got.extend(rp["timings"])
+                off += rp["returned"]
+            check("capture_hdr", hdr is not None
+                  and hdr["from_capture"] == 1 and hdr["carrier"] == 0
+                  and hdr["measured"] == 0 and hdr["complete"] == 1,
+                  repr(hdr))
+            check("capture_decodes_nec", nec_decode(got) == (0x04, 0x08),
+                  f"{len(got)} timings, head {got[:4]}")
+
+            # Raw TX of the captured object: one physical train.
+            s = act(OP_TX_RAW, struct.pack("<Q", cap_id) + bytes([1])
+                    + struct.pack("<I", 5000))
+            f = action_outcome(link, s, timeout=8.0)
+            ts = tx_summary(f)
+            check("txraw_captured", f is not None and f.type == 12
+                  and result_status(f) == S_OK and ts is not None
+                  and ts[1] == 1 and ts[2] == 1, repr(f))
+
+        # Upload the synthetic NEC wave under this session and send
+        # it too: second (and last) physical train.
+        s4 = act(OP_OBJ_BEGIN, obj_begin_pl(len(wave), crc))
+        action_outcome(link, s4)
+        s = act(OP_OBJ_CHUNK, obj_chunk_pl(s4, 0, wave[:64]))
+        action_outcome(link, s)
+        s = act(OP_OBJ_CHUNK, obj_chunk_pl(s4, 64, wave[64:]))
+        action_outcome(link, s)
+        s = act(OP_OBJ_COMMIT, struct.pack("<Q", s4))
+        f = action_outcome(link, s)
+        check("commit_post_resume", f is not None
+              and result_status(f) == S_OK, repr(f))
+        s = act(OP_TX_RAW, struct.pack("<Q", s4) + bytes([1])
+                + struct.pack("<I", 5000))
+        f = action_outcome(link, s, timeout=8.0)
+        ts = tx_summary(f)
+        check("txraw_uploaded", f is not None and f.type == 12
+              and result_status(f) == S_OK and ts is not None
+              and ts[1] == 1 and ts[2] == 1, repr(f))
+
+        # Physical verdict: exactly the two trains, both NEC 4/8.
+        try:
+            wout, _ = wit.communicate(timeout=140)
+        except subprocess.TimeoutExpired:
+            wit.kill()
+            wout, _ = wit.communicate()
+        wit = None
+        verdict = None
+        try:
+            with open(out_path) as fh:
+                verdict = json.load(fh)
+        except (OSError, ValueError):
+            pass
+        frames = verdict["frames"] if verdict else []
+        data = [fr for fr in frames if fr["kind"] == "data"]
+        reps = [fr for fr in frames if fr["kind"] == "repeat"]
+        check("witness_heard", verdict is not None
+              and verdict["edges"] > 0,
+              (repr(verdict) if verdict else (wout or ""))[:300])
+        check("witness_exactly_two_frames", len(data) == 2
+              and all(fr["addr"] == 0x04 and fr["cmd"] == 0x08
+                      for fr in data), repr(frames))
+        check("witness_no_repeats", len(reps) == 0, repr(frames))
+    finally:
+        if wit is not None:
+            wit.kill()
+        echo.stop()
+
+
+def case_c15c(link):
+    """C15 capture-only rerun: nothing between launch and the
+    capture windows, so the operator's presses align with the
+    windows. On a landing: read back, host-side NEC decode, header
+    truthfulness, one witness-judged raw TX of the captured object."""
+    import json
+    import os
+    import subprocess
+
+    seq = [0]
+
+    def next_seq():
+        seq[0] += 1
+        return seq[0]
+
+    nonce = (0xC15CEC01).to_bytes(16, "little")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    wit = None
+    try:
+        check("c15c_session", ident is not None, repr(ident))
+        if ident is None:
+            return
+        out_path = "/tmp/witness_c15c.json"
+        try:
+            os.unlink(out_path)
+        except FileNotFoundError:
+            pass
+        wit = subprocess.Popen(
+            ["/usr/bin/python3" if os.path.exists("/usr/bin/python3")
+             else sys.executable,
+             os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "witness_ir.py"),
+             "--seconds", "130", "--out", out_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        time.sleep(2.0)
+
+        cap = None
+        for attempt in range(4):
+            print(f"window {attempt + 1} opens at {time.time():.1f}",
+                  flush=True)
+            s = next_seq()
+            send_req(link, ident, s, struct.pack("<I", 20000),
+                     op=OP_RX_RAW)
+            f = action_outcome(link, s, timeout=26.0)
+            rs = rawrx_summary(f)
+            print(f"window {attempt + 1} closes at {time.time():.1f} "
+                  f"summary={rs}", flush=True)
+            if rs is not None and rs[1] != 0:
+                cap = (f, rs)
+                break
+        check("c15c_capture_landed", cap is not None,
+              "no burst in 4 windows")
+        if cap is not None:
+            f, rs = cap
+            check("c15c_capture_summary", result_status(f) == S_OK
+                  and rs[4] == 1 and 55 <= rs[2] <= 85 and rs[3] != 0,
+                  repr(rs))
+            cap_id = rs[1]
+            got = []
+            hdr = None
+            off = 0
+            while off < rs[2]:
+                rf = obj_read(link, ident, 960 - off, cap_id, off, 32)
+                rp = obj_read_parse(rf)
+                if rp is None or rp["returned"] == 0:
+                    break
+                if hdr is None:
+                    hdr = rp
+                got.extend(rp["timings"])
+                off += rp["returned"]
+            check("c15c_capture_hdr", hdr is not None
+                  and hdr["from_capture"] == 1 and hdr["carrier"] == 0
+                  and hdr["measured"] == 0 and hdr["complete"] == 1,
+                  repr(hdr))
+            check("c15c_capture_decodes_nec",
+                  nec_decode(got) == (0x04, 0x08),
+                  f"{len(got)} timings, head {got[:4]}")
+            s = next_seq()
+            send_req(link, ident, s,
+                     struct.pack("<Q", cap_id) + bytes([1])
+                     + struct.pack("<I", 5000), op=OP_TX_RAW)
+            f = action_outcome(link, s, timeout=8.0)
+            ts = tx_summary(f)
+            check("c15c_txraw_captured", f is not None and f.type == 12
+                  and result_status(f) == S_OK and ts is not None
+                  and ts[1] == 1 and ts[2] == 1, repr(f))
+
+        try:
+            wout, _ = wit.communicate(timeout=150)
+        except subprocess.TimeoutExpired:
+            wit.kill()
+            wout, _ = wit.communicate()
+        wit = None
+        verdict = None
+        try:
+            with open(out_path) as fh:
+                verdict = json.load(fh)
+        except (OSError, ValueError):
+            pass
+        frames = verdict["frames"] if verdict else []
+        data = [fr for fr in frames if fr["kind"] == "data"]
+        reps = [fr for fr in frames if fr["kind"] == "repeat"]
+        check("c15c_witness_heard", verdict is not None
+              and verdict["edges"] > 0,
+              (repr(verdict) if verdict else (wout or ""))[:300])
+        check("c15c_witness_exactly_one_frame", len(data) == 1
+              and data[0]["addr"] == 0x04 and data[0]["cmd"] == 0x08,
+              repr(frames))
+        check("c15c_witness_no_repeats", len(reps) == 0, repr(frames))
+    finally:
+        if wit is not None:
+            wit.kill()
+        echo.stop()
+
+
+def case_c15w(link):
+    """C15 witnessed captured-TX finisher, two phases: (1) capture a
+    real remote burst on the signal choreography; (2) after a quiet
+    pause (operator stops pressing), arm a FRESH witness window for
+    the transmission alone — exactly one NEC data frame may appear.
+    (A witness armed during phase 1 hears the operator's own remote;
+    that pollution is why this case exists.)"""
+    import json
+    import os
+    import subprocess
+
+    seq = [0]
+
+    def next_seq():
+        seq[0] += 1
+        return seq[0]
+
+    nonce = (0xC15DEC03).to_bytes(16, "little")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    wit = None
+    try:
+        check("c15w_session", ident is not None, repr(ident))
+        if ident is None:
+            return
+        cap = None
+        for attempt in range(3):
+            s = next_seq()
+            send_req(link, ident, s, struct.pack("<I", 20000),
+                     op=OP_RX_RAW)
+            f = action_outcome(link, s, timeout=26.0)
+            rs = rawrx_summary(f)
+            if rs is not None and rs[1] != 0:
+                cap = (f, rs)
+                break
+        check("c15w_capture_landed", cap is not None,
+              "no burst in 3 windows")
+        if cap is None:
+            return
+        f, rs = cap
+        cap_id = rs[1]
+        got = []
+        off = 0
+        while off < rs[2]:
+            rf = obj_read(link, ident, 960 - off, cap_id, off, 32)
+            rp = obj_read_parse(rf)
+            if rp is None or rp["returned"] == 0:
+                break
+            got.extend(rp["timings"])
+            off += rp["returned"]
+        check("c15w_capture_decodes_nec", nec_decode(got) == (0x04, 0x08),
+              f"{len(got)} timings")
+
+        # Quiet gap: no jobs, no signals — the operator stops here.
+        time.sleep(6.0)
+        out_path = "/tmp/witness_c15w.json"
+        try:
+            os.unlink(out_path)
+        except FileNotFoundError:
+            pass
+        wit = subprocess.Popen(
+            ["/usr/bin/python3" if os.path.exists("/usr/bin/python3")
+             else sys.executable,
+             os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "witness_ir.py"),
+             "--seconds", "30", "--out", out_path],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        time.sleep(2.0)  # witness armed before the single train
+        s = next_seq()
+        send_req(link, ident, s,
+                 struct.pack("<Q", cap_id) + bytes([1])
+                 + struct.pack("<I", 5000), op=OP_TX_RAW)
+        f = action_outcome(link, s, timeout=8.0)
+        ts = tx_summary(f)
+        check("c15w_txraw", f is not None and f.type == 12
+              and result_status(f) == S_OK and ts is not None
+              and ts[1] == 1 and ts[2] == 1, repr(f))
+        try:
+            wout, _ = wit.communicate(timeout=40)
+        except subprocess.TimeoutExpired:
+            wit.kill()
+            wout, _ = wit.communicate()
+        wit = None
+        verdict = None
+        try:
+            with open(out_path) as fh:
+                verdict = json.load(fh)
+        except (OSError, ValueError):
+            pass
+        frames = verdict["frames"] if verdict else []
+        data = [fr for fr in frames if fr["kind"] == "data"]
+        reps = [fr for fr in frames if fr["kind"] == "repeat"]
+        check("c15w_witness_heard", verdict is not None
+              and verdict["edges"] > 0,
+              (repr(verdict) if verdict else (wout or ""))[:300])
+        check("c15w_witness_exactly_one_frame", len(data) == 1
+              and data[0]["addr"] == 0x04 and data[0]["cmd"] == 0x08,
+              repr(frames))
+        check("c15w_witness_no_repeats", len(reps) == 0, repr(frames))
+    finally:
+        if wit is not None:
+            wit.kill()
+        echo.stop()
+
+
 def case_c14l(link):
     """C14L (L02 on a real module): drop the ACCEPTED of a running IR
     RX job, retry the identical request — the firmware replays
@@ -2218,6 +2882,12 @@ def main():
             case_c12x(link)
         elif args.case == "C13":
             case_c13(link)
+        elif args.case == "C15":
+            case_c15(link)
+        elif args.case == "C15C":
+            case_c15c(link)
+        elif args.case == "C15W":
+            case_c15w(link)
         elif args.case == "C14L":
             case_c14l(link)
         elif args.case == "C14G":

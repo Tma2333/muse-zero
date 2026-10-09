@@ -308,3 +308,102 @@ new action ID can transmit again after cleanup. Physical proof is a
 separate channel: an independent receiver (Pi GPIO + VS1838,
 `tools/witness_ir.py`) counts the frames that actually left the LED,
 and the C13 gate compares that count against the admissions.
+
+## Notifications — bench signals (2026-10-08)
+
+Effects 4–8 (op 0x0301) generalize the notification module into the
+bridge's device-signal surface, operator-designed: the hardware
+itself announces state, so a human at the bench never has to infer
+timing from a chat message.
+
+- `DOUBLE_BEEP` (4): two 100 ms notes with a 50 ms gap — the
+  start/end marker. Explicit actions always play.
+- `LISTEN_ON` (5) / `LISTEN_OFF` (6): drive the listening
+  indicator. While anything is listening (flag set), the main loop
+  flashes the blue LED about once a second; the blink sequence
+  extinguishes itself, so clearing the flag needs no LED cleanup.
+- `SIGNALS_OFF` (7) / `SIGNALS_ON` (8): mute/unmute the AUTOMATIC
+  job signals only (long cycle tests run SIGNALS_OFF first).
+
+Automatic signals: every hardware-listening job plays DOUBLE_BEEP
+as its receiver opens (the beeps finish, then listening starts)
+and again when it closes (capture, timeout, or cancel — always
+after the receiver stops), and sets the listening flag for its
+whole run. IR RX (decoded and raw) implements this today; NFC, LF
+RFID, and Sub-GHz receive jobs inherit the same hooks. The flag is
+the truth about listening — like a webcam light — and the mute
+gate silences only the annunciation, never the flag's meaning for
+jobs that set it.
+
+## Raw IR + bounded objects (C15, ops 0x0410/0x0411, 0x0901–0x0905)
+
+Design: `docs/c15-raw-ir-design.md` (plan §22.3/22.4). One mutable
+object slot and one committed slot, each a fixed 512×u32 buffer of
+microsecond durations plus metadata — no allocation after boot.
+Objects are session-owned; the object id is the creating action's
+sequence. Objects survive lease expiry (the identity is unchanged)
+but a replacing session — including a resume, which mints a fresh
+identity — purges the previous owner's objects once the executor
+is idle. App exit frees everything (RAM-only, like the ledger).
+
+- `OBJECT_BEGIN` (action) `object_type:u8=1, timing_count:u16
+  (1–512), carrier_hz:u32, duty_permille:u16, starts_with_mark:u8=1,
+  checksum:u32` (14 bytes). Replay parameters must be exactly
+  38000 Hz / 330 permille in this increment — they are explicit
+  replay settings, never measurements; anything else is a consumed
+  INVALID_ARGUMENT. A busy mutable slot is an admitted BUSY
+  terminal. Uploads expire absolutely 60 s after BEGIN.
+- `OBJECT_CHUNK` (action) `object_id:u64, offset:u16, count:u8
+  (1–64), duration_us[count]:u32`. Chunks must be contiguous. An
+  already-written identical range is acknowledged without
+  rewriting (a lost reply is recoverable two ways: same-seq ledger
+  replay, or a fresh identical chunk); conflicting or overlapping
+  data is an admitted INVALID_ARGUMENT terminal; holes can never
+  commit.
+- `OBJECT_COMMIT` (action) `object_id:u64`. Verifies received ==
+  declared count, each duration 1–1000000 µs, total ≤ 2000000 µs
+  (64-bit accumulation), and CRC-32/ISO-HDLC over the canonical
+  little-endian durations against the declared checksum. Only a
+  successful commit produces a transmissible object. Summary:
+  `status:u16, object_id:u64, crc32:u32` (BEGIN/CHUNK/RELEASE
+  share this shape, crc 0).
+- `OBJECT_READ` (query, session envelope required; a foreign
+  identity gets OUTCOME_UNAVAILABLE) `object_id:u64, offset:u16,
+  count:u8 (1–32)`. Reply: `present, capture_complete,
+  from_capture, carrier_measured:u8, total_count:u16,
+  returned:u8, crc32:u32, carrier_hz:u32, duty_permille:u16,
+  starts_with_mark:u8, timings[returned]:u32`. An unknown or
+  foreign id returns RESOURCE_UNAVAILABLE with no payload. A
+  capture reports carrier 0 / measured 0 — unknown, never the
+  replay defaults.
+- `OBJECT_RELEASE` (action) `object_id:u64`. Frees a committed or
+  in-progress object; an object pinned by a running TX is never
+  freed (BUSY).
+- `IR_RX_RAW_START` (action, op 0x0410) `timeout_ms:u32`
+  (1–60000). The IR worker runs with decoding disabled; the first
+  burst is staged (up to the worker's 1024-timing capacity) and
+  ends the job. At terminal publication the capture is published
+  into the committed slot: ≤512 valid timings → complete object,
+  carrier unknown. A count of 513–1024 ends the job with OVERFLOW
+  and publishes an explicitly incomplete diagnostic object (never
+  transmissible); >1024 the worker itself discards the burst and
+  the job times out with no object. Timeout with no burst is an OK
+  completion with no object. Summary: `status:u16, object_id:u64
+  (0 = none), timing_count:u16, crc32:u32, capture_complete:u8`.
+- `IR_TX_RAW` (action, op 0x0411) `object_id:u64, frame_count:u8
+  (=1), timeout_ms:u32`. The object must exist in the committed
+  slot, belong to the session, and be complete — checked at
+  request validation (consumed RESOURCE_UNAVAILABLE otherwise), so
+  a partial or partial-uploaded waveform can never emit. The job
+  pins the object from start to cleanup and replays it through
+  the same finite provider discipline as decoded TX (supplied
+  once, then Stop; completion on exhaustion + quiescing stop —
+  raw signals seed the same unreachable sent-callback path in the
+  1.4.3 worker). Playback is 38000 Hz / 0.330 duty, the object's
+  declared replay settings. Summary mirrors decoded TX:
+  `status:u16, supplied:u32, sent:u32` (trains, always 0/1 here).
+
+Qualification: `evidence/C15-raw-ir-2026-10-08.md`. Note for
+witness design: a witness armed while the operator is pressing a
+remote hears the operator too — witness windows for TX verdicts
+must be armed after the operator's part ends (see the C15W case).

@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-10-08 — Raw IR + bench signals
+
+- **Raw IR capture and replay**: a listening job stores the first
+  burst's microsecond timings as a bounded object (512 timings,
+  CRC-checked); the object can be read back in pages and replayed
+  as exactly one finite train at its declared carrier settings.
+  Captures report carrier as *unknown* rather than inventing a
+  measurement, over-cap captures are retained only as explicitly
+  incomplete diagnostics that can never transmit, and partially
+  uploaded objects can never emit. Verified on hardware: a real
+  remote capture decoded independently on the host, and both
+  captured and uploaded waveforms counted frame-by-frame by the
+  bench receiver (exactly one frame each)
+- **Bounded object transfer**: chunked upload with contiguous
+  ranges, identical-range re-acknowledgment for lost replies, and
+  commit-time validation (count, per-duration bounds, total,
+  checksum). Objects are session-owned and purged when a session
+  is replaced
+- **Bench signals**: the device announces its own listening state
+  — a double beep when a listening period opens and closes and a
+  flashing LED while it lasts — generalized to every listening
+  job and drivable from the host as notification effects, with a
+  mute gate for long cycle tests. Designed at the bench after a
+  chat-timed test missed its windows; with the signals, the same
+  capture landed in under four seconds
+
 ## 2026-10-08 — P1-A complete: bridge 1.0
 
 The first usable release is qualified end-to-end on stock firmware

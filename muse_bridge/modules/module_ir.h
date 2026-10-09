@@ -25,6 +25,7 @@ extern "C" {
 typedef struct {
     /* Platform worker lifecycle. Executed on the executor thread. */
     bool (*rx_start)(void* ctx);
+    bool (*rx_start_raw)(void* ctx); /* decoding disabled (C15) */
     void (*rx_stop)(void* ctx); /* stop + join + free */
     bool (*tx_start)(void* ctx);
     void (*tx_stop)(void* ctx); /* stop (waits out current signal) + free */
@@ -149,6 +150,112 @@ typedef struct {
 } MbIrTxSummary;
 
 void mb_ir_tx_last_summary(MbIrTxSummary* out);
+
+/* ---- C15: raw capture (plan 22.3/22.4, op IR_RX_RAW_START) -------
+ * The worker runs with decoding disabled; the first received burst
+ * is copied into a staging buffer (up to the worker's own 1024
+ * timing capacity) and ends the job. The app publishes the staged
+ * capture into the object store at terminal time; the module only
+ * reports what the worker delivered, including an over-cap count,
+ * so nothing truncated is ever relabeled complete here either. */
+#define MB_IR_RAW_STAGE_MAX 1024
+#define MB_IR_OBJ_TIMING_CAP 512 /* plan 22.4 object cap */
+
+typedef struct {
+    uint32_t timeout_ms;
+} MbIrRawParams;
+
+typedef struct {
+    MbIrRawParams params;
+    uint32_t t0;
+    bool anchored;
+    bool stop_seen;
+    bool worker_on;
+    volatile bool have; /* a burst was staged */
+    volatile uint32_t count; /* worker's full timing count */
+    uint32_t stage[MB_IR_RAW_STAGE_MAX];
+} MbIrRawRxState;
+
+extern const MbModule mb_module_ir_raw_rx;
+
+bool mb_ir_raw_validate_params(const MbIrRawParams* params, MbStatus* out_status);
+
+/* Called from the platform received-signal callback when the signal
+ * is raw (worker thread): copies the timings immediately. */
+void mb_ir_raw_on_timings(const uint32_t* timings, size_t count);
+
+/* The most recently finished capture, snapshotted at cleanup. */
+typedef struct {
+    bool have;
+    uint32_t count; /* full worker count (may exceed stored) */
+    const uint32_t* timings; /* staged values, count capped at 1024 */
+    uint32_t stored; /* min(count, 1024) */
+    uint32_t captures_total;
+    uint32_t over_cap_total;
+} MbIrRawSummary;
+
+void mb_ir_raw_last_summary(MbIrRawSummary* out);
+
+/* ---- C15: finite raw transmit (op IR_TX_RAW) ----------------------
+ * Mirrors the decoded finite provider: the staged object timings
+ * are handed out exactly once (New), then Stop forever. Completion
+ * semantics are C13's, for a source-verified reason: the 1.4.3
+ * worker seeds repeats_left = 1 for raw signals too and decrements
+ * it for the first message, so the message-sent callback is equally
+ * unreachable for a lone raw train; exhaustion + the quiescing TX
+ * stop establish physical completion. The object is pinned by the
+ * integrator's callbacks from start to cleanup. */
+typedef struct {
+    uint64_t object_id;
+    uint8_t frame_count; /* must be 1 in this increment */
+    uint32_t timeout_ms;
+} MbIrTxRawParams;
+
+typedef struct {
+    bool (*pin)(void* ctx, uint64_t object_id);
+    void (*unpin)(void* ctx, uint64_t object_id);
+    void* ctx;
+} MbIrTxRawBind;
+
+typedef struct {
+    MbIrTxRawParams params;
+    uint32_t t0;
+    bool anchored;
+    bool stop_seen;
+    bool worker_on;
+    bool pinned;
+    uint16_t count;
+    uint32_t timings[MB_IR_OBJ_TIMING_CAP];
+    volatile uint32_t supplied; /* trains handed to the worker (0/1) */
+    volatile bool exhausted;
+    volatile uint32_t sent;
+    bool finished;
+} MbIrTxRawState;
+
+extern const MbModule mb_module_ir_tx_raw;
+
+void mb_ir_tx_raw_bind(const MbIrTxRawBind* bind);
+bool mb_ir_tx_raw_validate_params(const MbIrTxRawParams* params, MbStatus* out_status);
+
+/* Stage the committed object's timings for the next TX job (called
+ * by the integrator at request validation, under the executor
+ * mutex; the single-outstanding-admission rule keeps the staging
+ * race-free until start consumes it). */
+void mb_ir_tx_raw_stage(const uint32_t* timings, uint16_t count);
+
+/* Called from the platform get-signal callback (worker thread). */
+MbIrTxSupply mb_ir_tx_raw_supply(const uint32_t** timings, uint16_t* count);
+
+/* Called from the platform message-sent callback (worker thread). */
+void mb_ir_tx_raw_on_sent(void);
+
+typedef struct {
+    uint32_t supplied;
+    uint32_t sent;
+    uint32_t tx_total; /* cumulative completed trains (finished jobs) */
+} MbIrTxRawSummary;
+
+void mb_ir_tx_raw_last_summary(MbIrTxRawSummary* out);
 
 #ifdef __cplusplus
 }

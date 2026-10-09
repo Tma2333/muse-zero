@@ -40,14 +40,15 @@
 #include "modules/module_adc.h"
 #include "modules/module_notify.h"
 #include "modules/module_ir.h"
+#include "modules/module_object.h"
 
 #if MB_RELEASE_BUILD
 #define BRIDGE_BUILD_ID "mb-1.0-rel-1"
 #else
-#define BRIDGE_BUILD_ID "mb-0.11-c13-2"
+#define BRIDGE_BUILD_ID "mb-0.12-c15-2"
 #endif
 #define BRIDGE_BAUD 230400
-#define BRIDGE_AUTO_EXIT_MS (90U * 1000U) /* was 20 s only in the c05h diagnostic build */
+#define BRIDGE_AUTO_EXIT_MS (600U * 1000U) /* dev-only bench safety net (compiled out of release); 600 s since C15 — witness-judged cases run minutes */
 #define BRIDGE_PARTIAL_MS 250U
 
 typedef struct {
@@ -101,6 +102,20 @@ typedef struct {
     MbIrTxParams ir_tx_params;
     MbIrHal ir_hal;
     InfraredWorker* ir_worker;
+    /* C15 raw IR + bounded object store. */
+    MbIrRawParams raw_rx_params;
+    MbIrTxRawParams raw_tx_params;
+    MbObjParams obj_params;
+    MbObjectStore objects;
+    MbIdentity obj_seen_identity;
+    bool obj_seen_valid;
+    /* Bench signals: signal_listen is the truth (a hardware-
+     * listening job or a host LISTEN_ON is active); the main loop
+     * flashes the LED while it is set. signal_muted silences the
+     * AUTOMATIC beeps/blinks for long cycle tests. */
+    bool signal_listen;
+    bool signal_muted;
+    uint32_t signal_last_blink;
     /* C07 wire job: the executor's current action sequence (0 = none)
      * and the executor counters at admission, for the terminal summary. */
     uint64_t active_seq;
@@ -456,6 +471,22 @@ static const NotificationSequence bridge_seq_short_vibro = {
     &message_delay_100,
     &message_vibro_off,
     NULL};
+/* Bench signals: double beep = a listening period starts/ends;
+ * a one-second blue blink repeats while the device is listening. */
+static const NotificationSequence bridge_seq_double_beep = {
+    &message_note_a5,
+    &message_delay_100,
+    &message_sound_off,
+    &message_delay_50,
+    &message_note_a5,
+    &message_delay_100,
+    &message_sound_off,
+    NULL};
+static const NotificationSequence bridge_seq_listen_blink = {
+    &message_blue_255,
+    &message_delay_100,
+    &message_blue_0,
+    NULL};
 
 static void bridge_notify_play(void* ctx, uint8_t effect) {
     BridgeApp* app = ctx;
@@ -471,10 +502,36 @@ static void bridge_notify_play(void* ctx, uint8_t effect) {
     case MB_NOTIFY_SHORT_VIBRATION:
         seq = &bridge_seq_short_vibro;
         break;
+    case MB_NOTIFY_DOUBLE_BEEP:
+        seq = &bridge_seq_double_beep; /* explicit: always plays */
+        break;
+    case MB_NOTIFY_LISTEN_ON:
+        app->signal_listen = true;
+        return;
+    case MB_NOTIFY_LISTEN_OFF:
+        app->signal_listen = false;
+        return;
+    case MB_NOTIFY_SIGNALS_OFF:
+        app->signal_muted = true;
+        return;
+    case MB_NOTIFY_SIGNALS_ON:
+        app->signal_muted = false;
+        return;
     default:
         return;
     }
     notification_message_block(app->notification, seq);
+}
+
+/* Automatic listening signals for hardware jobs (respect the mute
+ * gate; called on the executor thread from the module glue). */
+static void bridge_signal_beeps(BridgeApp* app) {
+    if(app == NULL || app->notification == NULL || app->signal_muted) return;
+    notification_message_block(app->notification, &bridge_seq_double_beep);
+}
+
+static void bridge_signal_set_listen(BridgeApp* app, bool on) {
+    if(app != NULL) app->signal_listen = on;
 }
 
 /* ---- C12 IR glue (InfraredWorker). The received-signal callback
@@ -482,7 +539,15 @@ static void bridge_notify_play(void* ctx, uint8_t effect) {
  * module ring immediately, never retain the message pointer. ---- */
 static void bridge_ir_on_signal(void* ctx, InfraredWorkerSignal* sig) {
     UNUSED(ctx);
-    if(sig == NULL || !infrared_worker_signal_is_decoded(sig)) return;
+    if(sig == NULL) return;
+    if(!infrared_worker_signal_is_decoded(sig)) {
+        /* C15 raw path: copy the worker's timings immediately. */
+        const uint32_t* timings = NULL;
+        size_t count = 0;
+        infrared_worker_get_raw_signal(sig, &timings, &count);
+        if(timings != NULL && count > 0) mb_ir_raw_on_timings(timings, count);
+        return;
+    }
     const InfraredMessage* m = infrared_worker_get_decoded_signal(sig);
     if(m == NULL || m->protocol != InfraredProtocolNEC) return;
     mb_ir_on_decoded(MB_IR_PROTOCOL_NEC, m->address, m->command, m->repeat);
@@ -496,16 +561,34 @@ static bool bridge_ir_rx_start(void* ctx) {
     infrared_worker_rx_set_received_signal_callback(
         app->ir_worker, bridge_ir_on_signal, app);
     infrared_worker_rx_enable_signal_decoding(app->ir_worker, true);
+    bridge_signal_beeps(app); /* listening opens when the beeps end */
     infrared_worker_rx_start(app->ir_worker);
+    bridge_signal_set_listen(app, true);
+    return true;
+}
+
+static bool bridge_ir_rx_start_raw(void* ctx) {
+    BridgeApp* app = ctx;
+    if(app->ir_worker != NULL) return false;
+    app->ir_worker = infrared_worker_alloc();
+    if(app->ir_worker == NULL) return false;
+    infrared_worker_rx_set_received_signal_callback(
+        app->ir_worker, bridge_ir_on_signal, app);
+    infrared_worker_rx_enable_signal_decoding(app->ir_worker, false);
+    bridge_signal_beeps(app); /* listening opens when the beeps end */
+    infrared_worker_rx_start(app->ir_worker);
+    bridge_signal_set_listen(app, true);
     return true;
 }
 
 static void bridge_ir_rx_stop(void* ctx) {
     BridgeApp* app = ctx;
+    bridge_signal_set_listen(app, false);
     if(app->ir_worker == NULL) return;
     infrared_worker_rx_stop(app->ir_worker);
     infrared_worker_free(app->ir_worker);
     app->ir_worker = NULL;
+    bridge_signal_beeps(app); /* listening has ended */
 }
 
 /* ---- C13 IR TX glue. The get-signal callback runs on the worker
@@ -514,6 +597,17 @@ static void bridge_ir_rx_stop(void* ctx) {
  * message-sent callback just bumps the portable counter. ---- */
 static InfraredWorkerGetSignalResponse bridge_ir_tx_get_signal(void* ctx, InfraredWorker* instance) {
     UNUSED(ctx);
+    /* C15 raw train first: its provider answers New exactly once for
+     * a staged object and Stop otherwise (including when no raw job
+     * is active), so the decoded provider is consulted only on Stop. */
+    const uint32_t* raw_timings = NULL;
+    uint16_t raw_count = 0;
+    if(mb_ir_tx_raw_supply(&raw_timings, &raw_count) == MB_IR_TX_NEW) {
+        infrared_worker_set_raw_signal(
+            instance, raw_timings, raw_count,
+            MB_OBJ_REPLAY_CARRIER_HZ, (float)MB_OBJ_REPLAY_DUTY_PERMILLE / 1000.0f);
+        return InfraredWorkerGetSignalResponseNew;
+    }
     uint8_t proto = 0;
     uint32_t addr = 0, cmd = 0;
     if(mb_ir_tx_supply(&proto, &addr, &cmd) != MB_IR_TX_NEW) {
@@ -528,6 +622,7 @@ static InfraredWorkerGetSignalResponse bridge_ir_tx_get_signal(void* ctx, Infrar
 static void bridge_ir_tx_sent(void* ctx) {
     UNUSED(ctx);
     mb_ir_tx_on_sent();
+    mb_ir_tx_raw_on_sent();
 }
 
 static bool bridge_ir_tx_start(void* ctx) {
@@ -638,6 +733,95 @@ static MbStatus bridge_ir_tx_validate_req(MbFrame* frame, MbIrTxParams* out) {
     return mb_ir_tx_validate_params(out, &v) ? MB_OK : v;
 }
 
+/* ---- C15 validators ---- */
+static uint32_t bridge_now_ms(void) {
+    return furi_get_tick(); /* tick base is 1 kHz on this target */
+}
+
+static bool bridge_obj_pin(void* ctx, uint64_t object_id) {
+    BridgeApp* app = ctx;
+    return mb_object_pin(&app->objects, object_id) == MB_OK;
+}
+
+static void bridge_obj_unpin(void* ctx, uint64_t object_id) {
+    BridgeApp* app = ctx;
+    mb_object_unpin(&app->objects, object_id);
+}
+
+static MbStatus bridge_ir_raw_rx_validate_req(MbFrame* frame, MbIrRawParams* out) {
+    *out = (MbIrRawParams){0};
+    if(frame->length != 4) return MB_INVALID_ARGUMENT;
+    out->timeout_ms = mb_u32(frame->payload);
+    MbStatus v;
+    return mb_ir_raw_validate_params(out, &v) ? MB_OK : v;
+}
+
+static MbStatus bridge_ir_tx_raw_validate_req(BridgeApp* app, MbFrame* frame, MbIrTxRawParams* out) {
+    *out = (MbIrTxRawParams){0};
+    if(frame->length != 13) return MB_INVALID_ARGUMENT;
+    out->object_id = mb_u64(frame->payload);
+    out->frame_count = frame->payload[8];
+    out->timeout_ms = mb_u32(frame->payload + 9);
+    MbStatus v;
+    if(!mb_ir_tx_raw_validate_params(out, &v)) return v;
+    /* Store gate: the object must exist, belong to this session, and
+     * be complete; its timings are staged for the job (consumed by
+     * the module's start). Serialized with executor state. */
+    furi_mutex_acquire(app->exec_mutex, FuriWaitForever);
+    const uint32_t* timings = NULL;
+    uint16_t count = 0;
+    MbStatus st = mb_object_tx_check(
+        &app->objects, &app->session.lease.identity, out->object_id, &timings, &count);
+    if(st == MB_OK) mb_ir_tx_raw_stage(timings, count);
+    furi_mutex_release(app->exec_mutex);
+    return st;
+}
+
+static MbStatus bridge_object_validate_req(MbFrame* frame, MbObjParams* out) {
+    *out = (MbObjParams){0};
+    out->op = frame->op;
+    switch(frame->op) {
+    case MB_OBJ_OP_BEGIN: {
+        if(frame->length != 14) return MB_INVALID_ARGUMENT;
+        out->object_type = frame->payload[0];
+        out->timing_count = mb_u16(frame->payload + 1);
+        out->carrier_hz = mb_u32(frame->payload + 3);
+        out->duty_permille = mb_u16(frame->payload + 7);
+        out->starts_with_mark = frame->payload[9] != 0;
+        out->checksum = mb_u32(frame->payload + 10);
+        /* Pure field rules mirror module_object_begin's, so a bad
+         * shape is a consumed rejection, not an admitted failure;
+         * state-dependent refusals (BUSY) stay execution outcomes. */
+        if(out->object_type != MB_OBJ_TYPE_RAW_IR) return MB_INVALID_ARGUMENT;
+        if(out->timing_count == 0 || out->timing_count > MB_OBJ_MAX_TIMINGS)
+            return MB_INVALID_ARGUMENT;
+        if(out->carrier_hz != MB_OBJ_REPLAY_CARRIER_HZ) return MB_INVALID_ARGUMENT;
+        if(out->duty_permille != MB_OBJ_REPLAY_DUTY_PERMILLE) return MB_INVALID_ARGUMENT;
+        if(frame->payload[9] != 1) return MB_INVALID_ARGUMENT;
+        return MB_OK;
+    }
+    case MB_OBJ_OP_CHUNK: {
+        if(frame->length < 11) return MB_INVALID_ARGUMENT;
+        out->object_id = mb_u64(frame->payload);
+        out->offset = mb_u16(frame->payload + 8);
+        out->count = frame->payload[10];
+        if(out->count == 0 || out->count > MB_OBJ_CHUNK_MAX) return MB_INVALID_ARGUMENT;
+        if(frame->length != (uint16_t)(11 + 4 * out->count)) return MB_INVALID_ARGUMENT;
+        for(uint8_t i = 0; i < out->count; i++)
+            out->durations[i] = mb_u32(frame->payload + 11 + 4 * i);
+        return MB_OK;
+    }
+    case MB_OBJ_OP_COMMIT:
+    case MB_OBJ_OP_RELEASE: {
+        if(frame->length != 8) return MB_INVALID_ARGUMENT;
+        out->object_id = mb_u64(frame->payload);
+        return MB_OK;
+    }
+    default:
+        return MB_INVALID_ARGUMENT;
+    }
+}
+
 static MbStatus bridge_adc_validate_req(BridgeApp* app, MbFrame* frame, MbAdcParams* out) {
     *out = (MbAdcParams){0};
     if(frame->length != 2) return MB_INVALID_ARGUMENT;
@@ -720,6 +904,62 @@ static size_t bridge_gpio_result(BridgeApp* app, uint16_t op, MbStatus status, u
         w += 4;
         break;
     }
+    case MB_OBJ_OP_RX_RAW_START: {
+        /* Publish the finished capture into the object store; the
+         * object id is this action's own sequence. Only natural
+         * completions publish: a cancelled/stopped capture commits
+         * nothing. */
+        mb_put_u64(out + w, 0);
+        w += 8; /* object_id, filled below when published */
+        MbIrRawSummary rs;
+        mb_ir_raw_last_summary(&rs);
+        uint16_t count = 0;
+        uint32_t crc = 0;
+        uint8_t complete = 0;
+        if(rs.have && (status == MB_OK || status == MB_OVERFLOW)) {
+            count = rs.count > 0xFFFF ? 0xFFFF : (uint16_t)rs.count;
+            MbStatus pub = mb_object_publish_capture(
+                &app->objects, &app->session.lease.identity, app->active_seq,
+                rs.timings, rs.count, furi_get_tick());
+            if(pub == MB_OK) {
+                MbObjectReadResult rr;
+                if(mb_object_read(
+                       &app->objects, &app->session.lease.identity, app->active_seq,
+                       0, 1, &rr) == MB_OK) {
+                    crc = rr.crc;
+                }
+                complete = 1;
+                mb_put_u64(out + 2, app->active_seq);
+            }
+        }
+        mb_put_u16(out + w, count);
+        w += 2;
+        mb_put_u32(out + w, crc);
+        w += 4;
+        out[w++] = complete;
+        break;
+    }
+    case MB_OBJ_OP_TX_RAW: {
+        MbIrTxRawSummary sum;
+        mb_ir_tx_raw_last_summary(&sum);
+        mb_put_u32(out + w, sum.supplied);
+        w += 4;
+        mb_put_u32(out + w, sum.sent);
+        w += 4;
+        break;
+    }
+    case MB_OBJ_OP_BEGIN:
+    case MB_OBJ_OP_CHUNK:
+    case MB_OBJ_OP_COMMIT:
+    case MB_OBJ_OP_RELEASE: {
+        MbObjectOpResult r;
+        mb_object_last_result(&r);
+        mb_put_u64(out + w, r.object_id);
+        w += 8;
+        mb_put_u32(out + w, r.crc);
+        w += 4;
+        break;
+    }
     default:
         break;
     }
@@ -740,11 +980,18 @@ static void bridge_handle_request(BridgeApp* app, MbFrame* frame) {
     MbNotifyParams notify = {0};
     MbIrParams ir = {0};
     MbIrTxParams irtx = {0};
+    MbIrRawParams rawrx = {0};
+    MbIrTxRawParams rawtx = {0};
+    MbObjParams obj = {0};
     bool is_gpio = frame->op >= MB_GPIO_OP_CONFIG && frame->op <= MB_GPIO_OP_RELEASE;
     bool is_adc = frame->op == MB_ADC_OP_READ;
     bool is_notify = frame->op == MB_NOTIFY_OP;
     bool is_ir = frame->op == MB_IR_OP_RX_START;
     bool is_ir_tx = frame->op == MB_IR_OP_TX_DECODED;
+    bool is_raw_rx = frame->op == MB_OBJ_OP_RX_RAW_START;
+    bool is_raw_tx = frame->op == MB_OBJ_OP_TX_RAW;
+    bool is_obj = frame->op == MB_OBJ_OP_BEGIN || frame->op == MB_OBJ_OP_CHUNK ||
+                  frame->op == MB_OBJ_OP_COMMIT || frame->op == MB_OBJ_OP_RELEASE;
 #if !MB_RELEASE_BUILD
     if(frame->op == BRIDGE_OP_FAKE_RUN) {
         if(frame->length != 6) {
@@ -770,6 +1017,12 @@ static void bridge_handle_request(BridgeApp* app, MbFrame* frame) {
         rejection = bridge_ir_validate_req(frame, &ir);
     } else if(is_ir_tx) {
         rejection = bridge_ir_tx_validate_req(frame, &irtx);
+    } else if(is_raw_rx) {
+        rejection = bridge_ir_raw_rx_validate_req(frame, &rawrx);
+    } else if(is_raw_tx) {
+        rejection = bridge_ir_tx_raw_validate_req(app, frame, &rawtx);
+    } else if(is_obj) {
+        rejection = bridge_object_validate_req(frame, &obj);
     } else {
         rejection = MB_UNSUPPORTED;
     }
@@ -867,6 +1120,33 @@ static void bridge_handle_request(BridgeApp* app, MbFrame* frame) {
         app->ir_tx_params = irtx;
         module = &mb_module_ir_tx;
         params = &app->ir_tx_params;
+    } else if(is_raw_rx) {
+        /* Timed raw capture; same deadline shape as decoded RX. */
+        uint32_t dur = 0, grace = 0;
+        mb_ticks_from_ms(rawrx.timeout_ms, hz, &dur);
+        mb_ticks_from_ms(5000, hz, &grace);
+        deadline = dur + grace;
+        app->raw_rx_params = rawrx;
+        module = &mb_module_ir_raw_rx;
+        params = &app->raw_rx_params;
+    } else if(is_raw_tx) {
+        /* Finite raw transmission; same deadline shape. */
+        uint32_t dur = 0, grace = 0;
+        mb_ticks_from_ms(rawtx.timeout_ms, hz, &dur);
+        mb_ticks_from_ms(5000, hz, &grace);
+        deadline = dur + grace;
+        app->raw_tx_params = rawtx;
+        module = &mb_module_ir_tx_raw;
+        params = &app->raw_tx_params;
+    } else if(is_obj) {
+        /* Instantaneous store action: completes in start(); the
+         * deadline is only the wedge guard. */
+        uint32_t grace = 0;
+        mb_ticks_from_ms(2000, hz, &grace);
+        deadline = grace;
+        app->obj_params = obj;
+        module = &mb_module_object;
+        params = &app->obj_params;
     } else {
         uint32_t dur_ticks = 0, int_ticks = 0, grace = 0;
         mb_ticks_from_ms(duration_ms, hz, &dur_ticks);
@@ -969,7 +1249,7 @@ static void bridge_handle_frame(BridgeApp* app, const uint8_t* encoded, size_t e
         resp[w++] = 0; /* app minor */
 #else
         resp[w++] = 0; /* app major */
-        resp[w++] = 10; /* app minor: ...9=C12 ir rx, 10=C13 ir tx */
+        resp[w++] = 11; /* app minor: ...10=C13 ir tx, 11=C15 raw ir + objects */
 #endif
         mb_put_u16(resp + w, 87);
         w += 2; /* fw_api_major the SDK was built against */
@@ -1015,6 +1295,13 @@ static void bridge_handle_frame(BridgeApp* app, const uint8_t* encoded, size_t e
             {MB_NOTIFY_OP, 1, MB_NOTIFY_MAX_EFFECT_MS}, /* limit = max effect ms */
             {MB_IR_OP_RX_START, 1, MB_IR_MAX_TIMEOUT_MS}, /* limit = max timeout ms */
             {MB_IR_OP_TX_DECODED, 1, MB_IR_MAX_TIMEOUT_MS}, /* limit = max timeout ms */
+            {MB_OBJ_OP_RX_RAW_START, 1, MB_IR_MAX_TIMEOUT_MS},
+            {MB_OBJ_OP_TX_RAW, 1, MB_IR_MAX_TIMEOUT_MS},
+            {MB_OBJ_OP_BEGIN, 1, MB_OBJ_MAX_TIMINGS}, /* limit = max timings */
+            {MB_OBJ_OP_CHUNK, 1, MB_OBJ_CHUNK_MAX}, /* limit = durations per chunk */
+            {MB_OBJ_OP_COMMIT, 1, 0},
+            {MB_OBJ_OP_READ, 0, MB_OBJ_READ_MAX}, /* kind 0: query */
+            {MB_OBJ_OP_RELEASE, 1, 0},
 #if !MB_RELEASE_BUILD
             {BRIDGE_OP_FAKE_RUN, 1, 60000},
 #endif
@@ -1023,6 +1310,7 @@ static void bridge_handle_frame(BridgeApp* app, const uint8_t* encoded, size_t e
         uint32_t cursor = mb_u16(frame.payload);
         uint32_t start = cursor < cap_count ? cursor : cap_count;
         uint32_t count = cap_count - start;
+        if(count > 14) count = 14; /* one page per reply (resp capacity) */
         uint8_t resp[4 + 14 * 7];
         size_t w = 0;
         resp[w++] = 3; /* page_type: capabilities */
@@ -1034,6 +1322,59 @@ static void bridge_handle_frame(BridgeApp* app, const uint8_t* encoded, size_t e
             w += 2;
             resp[w++] = caps[start + i].kind;
             mb_put_u32(resp + w, caps[start + i].limit);
+            w += 4;
+        }
+        bridge_send_frame(app, 9, frame.op, MB_OK, frame.correlation, resp, w);
+        return;
+    }
+
+    if(frame.op == MB_OBJ_OP_READ) { /* OBJECT_READ (QUERY): C15 */
+        if(frame.length != 11) {
+            bridge_send_frame(app, 9, frame.op, MB_INVALID_ARGUMENT, frame.correlation, NULL, 0);
+            return;
+        }
+        /* Session envelope required: a foreign identity learns
+         * nothing, not even presence. */
+        if(memcmp(frame.identity.boot, app->session.lease.identity.boot, 16) != 0 ||
+           memcmp(frame.identity.session, app->session.lease.identity.session, 16) != 0 ||
+           frame.identity.generation != app->session.lease.identity.generation) {
+            bridge_send_frame(app, 9, frame.op, MB_OUTCOME_UNAVAILABLE, frame.correlation, NULL, 0);
+            return;
+        }
+        uint64_t obj_id = mb_u64(frame.payload);
+        uint16_t offset = mb_u16(frame.payload + 8);
+        uint8_t count = frame.payload[10];
+        if(count == 0 || count > MB_OBJ_READ_MAX) {
+            bridge_send_frame(app, 9, frame.op, MB_INVALID_ARGUMENT, frame.correlation, NULL, 0);
+            return;
+        }
+        MbObjectReadResult rr;
+        furi_mutex_acquire(app->exec_mutex, FuriWaitForever);
+        MbStatus st = mb_object_read(
+            &app->objects, &app->session.lease.identity, obj_id, offset, count, &rr);
+        furi_mutex_release(app->exec_mutex);
+        if(st != MB_OK) {
+            bridge_send_frame(app, 9, frame.op, st, frame.correlation, NULL, 0);
+            return;
+        }
+        uint8_t resp[18 + MB_OBJ_READ_MAX * 4];
+        size_t w = 0;
+        resp[w++] = rr.present ? 1 : 0;
+        resp[w++] = rr.complete ? 1 : 0;
+        resp[w++] = rr.from_capture ? 1 : 0;
+        resp[w++] = rr.carrier_measured ? 1 : 0;
+        mb_put_u16(resp + w, rr.total_count);
+        w += 2;
+        resp[w++] = rr.returned;
+        mb_put_u32(resp + w, rr.crc);
+        w += 4;
+        mb_put_u32(resp + w, rr.carrier_hz);
+        w += 4;
+        mb_put_u16(resp + w, rr.duty_permille);
+        w += 2;
+        resp[w++] = rr.starts_with_mark ? 1 : 0;
+        for(uint8_t i = 0; i < rr.returned; i++) {
+            mb_put_u32(resp + w, rr.timings[i]);
             w += 4;
         }
         bridge_send_frame(app, 9, frame.op, MB_OK, frame.correlation, resp, w);
@@ -1276,6 +1617,10 @@ static void bridge_write_result(BridgeApp* app) {
         mb_ir_last_summary(&irs);
         MbIrTxSummary irtxs;
         mb_ir_tx_last_summary(&irtxs);
+        MbIrRawSummary irraws;
+        mb_ir_raw_last_summary(&irraws);
+        MbIrTxRawSummary irrawtxs;
+        mb_ir_tx_raw_last_summary(&irrawtxs);
         int len = snprintf(
             buf,
             sizeof(buf),
@@ -1284,7 +1629,8 @@ static void bridge_write_result(BridgeApp* app) {
             "exec_starts=%lu exec_terminals=%lu fake_exec=%lu fake_terminals=%lu fake_status=%lu "
             "cancels=%lu gpio_cfg=%lu gpio_wr=%lu gpio_rd=%lu gpio_rel=%lu gpio_exp=%lu gpio_claims=%lu "
             "adc_rd=%lu adc_smp=%lu ntfy=%lu ir_dec=%lu ir_emit=%lu ir_drop=%lu "
-            "ir_tx_sup=%lu ir_tx_sent=%lu "
+            "ir_tx_sup=%lu ir_tx_sent=%lu ir_raw_cap=%lu ir_raw_over=%lu "
+            "ir_rawtx_sup=%lu ir_rawtx_sent=%lu ir_rawtx_tot=%lu "
             "data_gen=%lu data_enq=%lu data_drop=%lu data_consumed=%lu exec_beats=%lu "
             "heap_sf=%lu heap_smin=%lu heap_sblk=%lu heap_ef=%lu heap_emin=%lu heap_eblk=%lu "
             "rx_bytes_1s=%lu rx_errors_1s=%lu "
@@ -1320,6 +1666,11 @@ static void bridge_write_result(BridgeApp* app) {
             (unsigned long)irs.dropped,
             (unsigned long)irtxs.supplied,
             (unsigned long)irtxs.sent,
+            (unsigned long)irraws.captures_total,
+            (unsigned long)irraws.over_cap_total,
+            (unsigned long)irrawtxs.supplied,
+            (unsigned long)irrawtxs.sent,
+            (unsigned long)irrawtxs.tx_total,
             (unsigned long)app->exec.generated,
             (unsigned long)app->exec.enqueued,
             (unsigned long)app->exec.dropped,
@@ -1419,11 +1770,17 @@ int32_t muse_bridge_app(void* context) {
     mb_notify_module_bind(&app->notify_state, &app->notify_hal);
     app->ir_hal = (MbIrHal){
         .rx_start = bridge_ir_rx_start,
+        .rx_start_raw = bridge_ir_rx_start_raw,
         .rx_stop = bridge_ir_rx_stop,
         .tx_start = bridge_ir_tx_start,
         .tx_stop = bridge_ir_tx_stop,
         .ctx = app};
     mb_ir_module_bind(&app->ir_hal);
+    /* C15: object store + raw TX pin discipline. */
+    mb_object_store_init(&app->objects);
+    mb_object_module_bind(&app->objects, &app->session.lease.identity, bridge_now_ms);
+    MbIrTxRawBind raw_bind = {.pin = bridge_obj_pin, .unpin = bridge_obj_unpin, .ctx = app};
+    mb_ir_tx_raw_bind(&raw_bind);
     app->notification = furi_record_open(RECORD_NOTIFICATION);
     app->exec_thread = furi_thread_alloc_ex("MbExec", 2048, bridge_exec_thread, app);
     furi_thread_start(app->exec_thread);
@@ -1474,6 +1831,33 @@ int32_t muse_bridge_app(void* context) {
                 bridge_trace(app, MB_EV_SESSION_LIVE, 0, 0);
             }
             app->prev_link = link_now;
+        }
+        /* C15: when the session identity is replaced (a new
+         * handshake — including a resume, which mints a fresh
+         * identity), objects owned by the previous identity are
+         * purged once the executor is idle. Lease expiry alone does
+         * not change the identity and frees nothing. */
+        {
+            const MbIdentity* cur_id = &app->session.lease.identity;
+            if(!app->obj_seen_valid) {
+                app->obj_seen_identity = *cur_id;
+                app->obj_seen_valid = true;
+            } else if(memcmp(&app->obj_seen_identity, cur_id, sizeof(MbIdentity)) != 0) {
+                furi_mutex_acquire(app->exec_mutex, FuriWaitForever);
+                if(!mb_executor_busy(&app->exec)) {
+                    mb_object_purge_session(&app->objects, &app->obj_seen_identity);
+                    app->obj_seen_identity = *cur_id;
+                }
+                furi_mutex_release(app->exec_mutex);
+            }
+        }
+        /* Bench signals: while anything is listening, flash the
+         * blue LED about once a second (non-blocking; the blink
+         * sequence extinguishes itself). */
+        if(app->signal_listen && !app->signal_muted &&
+           now_ms0 - app->signal_last_blink >= 900) {
+            app->signal_last_blink = now_ms0;
+            notification_message(app->notification, &bridge_seq_listen_blink);
         }
         /* While linked, offer a fresh heartbeat challenge every 500 ms.
          * The lease records creation before enqueueing; a failed send
@@ -1560,7 +1944,7 @@ int32_t muse_bridge_app(void* context) {
             bridge_trace(app, MB_EV_JOB_TERMINAL, term_job, (uint32_t)term_status);
             if(term_job == app->active_seq && app->active_seq != 0) {
                 uint16_t done_op = app->active_op ? app->active_op : BRIDGE_OP_FAKE_RUN;
-                uint8_t result[16];
+                uint8_t result[32];
                 size_t result_len;
                 if(done_op == BRIDGE_OP_FAKE_RUN) {
                     mb_put_u16(result, (uint16_t)term_status);

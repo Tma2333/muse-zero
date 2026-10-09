@@ -8,7 +8,7 @@ void mb_notify_init(MbNotifyState* state) {
 }
 
 MbStatus mb_notify_validate(uint8_t effect) {
-    if(effect < MB_NOTIFY_GREEN_FLASH || effect > MB_NOTIFY_SHORT_VIBRATION) {
+    if(effect < MB_NOTIFY_GREEN_FLASH || effect > MB_NOTIFY_SIGNALS_ON) {
         return MB_INVALID_ARGUMENT;
     }
     return MB_OK;

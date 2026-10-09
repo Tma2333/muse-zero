@@ -107,12 +107,15 @@ int main(void) {
     CHECK(mb_notify_validate(1) == MB_OK);
     CHECK(mb_notify_validate(2) == MB_OK);
     CHECK(mb_notify_validate(3) == MB_OK);
-    CHECK(mb_notify_validate(4) == MB_INVALID_ARGUMENT);
+    CHECK(mb_notify_validate(4) == MB_OK);
+    CHECK(mb_notify_validate(5) == MB_OK);
+    CHECK(mb_notify_validate(8) == MB_OK);
+    CHECK(mb_notify_validate(9) == MB_INVALID_ARGUMENT);
     MbNotifyState ns;
     mb_notify_init(&ns);
     FakeNotify fn = {0};
     MbNotifyHal nhal = {.play = notify_play, .ctx = &fn};
-    CHECK(mb_notify_apply(&ns, &nhal, 4) == MB_INVALID_ARGUMENT);
+    CHECK(mb_notify_apply(&ns, &nhal, 9) == MB_INVALID_ARGUMENT);
     CHECK(fn.plays == 0);
     CHECK(mb_notify_apply(&ns, &nhal, MB_NOTIFY_SHORT_BEEP) == MB_OK);
     CHECK(fn.plays == 1 && fn.last == 2 && ns.effects_played == 1);

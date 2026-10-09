@@ -87,10 +87,15 @@ advertised capability list. Release history: [CHANGELOG.md](CHANGELOG.md).
       fault-injection matrix, 100-cycle endurance per module,
       30-minute receive soak with injected link drops, release build
       with the development test operation removed
+- [x] Raw IR: capture a real remote's timing waveform into a
+      bounded object, replay it as one finite train — captured and
+      uploaded waveforms both proven against the bench receiver
+- [x] Bench signals: the device announces listening state itself
+      (double beep at open/close, flashing LED while listening), so
+      a human at the bench never has to guess test timing
 
 **Next**
 
-- [ ] Raw IR capture/transfer objects (bounded timings)
 - [ ] NFC discovery and card identification
 - [ ] LF RFID read
 - [ ] Sub-GHz receive: signal strength, then one decoded format

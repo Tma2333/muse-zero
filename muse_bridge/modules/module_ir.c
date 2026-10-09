@@ -253,3 +253,256 @@ const MbModule mb_module_ir_tx = {
     .request_stop = ir_tx_request_stop,
     .cleanup = ir_tx_cleanup,
 };
+
+/* ---- C15 raw capture ---- */
+static MbIrRawRxState* ir_raw_active;
+static MbIrRawSummary ir_raw_summary;
+static uint32_t ir_raw_stage_snap[MB_IR_RAW_STAGE_MAX];
+
+bool mb_ir_raw_validate_params(const MbIrRawParams* params, MbStatus* out_status) {
+    MbStatus s = MB_OK;
+    if(params == NULL || params->timeout_ms == 0 || params->timeout_ms > MB_IR_MAX_TIMEOUT_MS) {
+        s = MB_INVALID_ARGUMENT;
+    }
+    if(out_status != NULL) *out_status = s;
+    return s == MB_OK;
+}
+
+void mb_ir_raw_last_summary(MbIrRawSummary* out) {
+    if(out != NULL) *out = ir_raw_summary;
+}
+
+void mb_ir_raw_on_timings(const uint32_t* timings, size_t count) {
+    MbIrRawRxState* s = ir_raw_active;
+    if(s == NULL || s->have || timings == NULL || count == 0) return;
+    size_t keep = count > MB_IR_RAW_STAGE_MAX ? MB_IR_RAW_STAGE_MAX : count;
+    memcpy(s->stage, timings, keep * sizeof(uint32_t));
+    s->count = (uint32_t)count; /* full worker count; keep is staged */
+    s->have = true; /* publish after the copy */
+}
+
+static MbStatus ir_raw_validate_fn(const void* params) {
+    MbStatus s;
+    if(!ir_hal_bound || ir_hal.rx_start_raw == NULL) return MB_INVALID_ARGUMENT;
+    return mb_ir_raw_validate_params(params, &s) ? MB_OK : s;
+}
+
+static MbStatus ir_raw_start(MbJobContext* job, const void* params) {
+    MbIrRawRxState* s = job->module_state;
+    const MbIrRawParams* p = params;
+    if(s == NULL || p == NULL || !ir_hal_bound) return MB_INIT_FAILED;
+    s->params = *p;
+    ir_raw_active = s;
+    if(!ir_hal.rx_start_raw(ir_hal.ctx)) {
+        ir_raw_active = NULL;
+        return MB_INIT_FAILED;
+    }
+    s->worker_on = true;
+    return MB_OK;
+}
+
+static void ir_raw_service(MbJobContext* job, uint32_t now) {
+    MbIrRawRxState* s = job->module_state;
+    if(!s->anchored) {
+        s->anchored = true;
+        s->t0 = now;
+    }
+    if(s->have) {
+        job->done = true;
+        /* Over-cap is an explicit terminal, never a silent truncate
+         * (plan section 8); within-cap captures complete OK and the
+         * store publish decides completeness of durations. */
+        job->done_status = s->count > MB_IR_OBJ_TIMING_CAP ? MB_OVERFLOW : MB_OK;
+        return;
+    }
+    if((uint32_t)(now - s->t0) >= s->params.timeout_ms) {
+        job->done = true;
+        job->done_status = MB_OK; /* no capture: an honest empty result */
+    }
+}
+
+static void ir_raw_request_stop(MbJobContext* job, MbStopReason reason) {
+    (void)reason;
+    MbIrRawRxState* s = job->module_state;
+    if(s != NULL) s->stop_seen = true;
+}
+
+static MbCleanupResult ir_raw_cleanup(MbJobContext* job) {
+    MbIrRawRxState* s = job->module_state;
+    if(s == NULL) return MB_CLEAN_OK;
+    if(ir_hal_bound && s->worker_on) {
+        ir_hal.rx_stop(ir_hal.ctx);
+        s->worker_on = false;
+    }
+    ir_raw_summary.have = s->have;
+    ir_raw_summary.count = s->have ? s->count : 0;
+    ir_raw_summary.stored = 0;
+    ir_raw_summary.timings = NULL;
+    if(s->have) {
+        uint32_t keep = s->count > MB_IR_RAW_STAGE_MAX ? MB_IR_RAW_STAGE_MAX : s->count;
+        memcpy(ir_raw_stage_snap, s->stage, keep * sizeof(uint32_t));
+        ir_raw_summary.stored = keep;
+        ir_raw_summary.timings = ir_raw_stage_snap;
+        ir_raw_summary.captures_total++;
+        if(s->count > MB_IR_OBJ_TIMING_CAP) ir_raw_summary.over_cap_total++;
+    }
+    ir_raw_active = NULL;
+    return MB_CLEAN_OK;
+}
+
+const MbModule mb_module_ir_raw_rx = {
+    .validate = ir_raw_validate_fn,
+    .ctx_size = sizeof(MbIrRawRxState),
+    .start = ir_raw_start,
+    .service = ir_raw_service,
+    .request_stop = ir_raw_request_stop,
+    .cleanup = ir_raw_cleanup,
+};
+
+/* ---- C15 finite raw transmit ---- */
+static MbIrTxRawBind ir_tx_raw_bind;
+static bool ir_tx_raw_bound;
+static MbIrTxRawState* ir_tx_raw_active;
+static MbIrTxRawSummary ir_tx_raw_summary;
+static uint32_t ir_tx_raw_stage_buf[MB_IR_OBJ_TIMING_CAP];
+static uint16_t ir_tx_raw_stage_count;
+static bool ir_tx_raw_stage_valid;
+
+void mb_ir_tx_raw_bind(const MbIrTxRawBind* bind) {
+    if(bind != NULL) ir_tx_raw_bind = *bind;
+    ir_tx_raw_bound = bind != NULL;
+}
+
+void mb_ir_tx_raw_last_summary(MbIrTxRawSummary* out) {
+    if(out != NULL) *out = ir_tx_raw_summary;
+}
+
+bool mb_ir_tx_raw_validate_params(const MbIrTxRawParams* params, MbStatus* out_status) {
+    MbStatus s = MB_OK;
+    if(params == NULL || params->frame_count != 1 || params->timeout_ms == 0 ||
+       params->timeout_ms > MB_IR_MAX_TIMEOUT_MS) {
+        s = MB_INVALID_ARGUMENT;
+    }
+    if(out_status != NULL) *out_status = s;
+    return s == MB_OK;
+}
+
+void mb_ir_tx_raw_stage(const uint32_t* timings, uint16_t count) {
+    if(timings == NULL || count == 0 || count > MB_IR_OBJ_TIMING_CAP) {
+        ir_tx_raw_stage_valid = false;
+        return;
+    }
+    memcpy(ir_tx_raw_stage_buf, timings, (size_t)count * sizeof(uint32_t));
+    ir_tx_raw_stage_count = count;
+    ir_tx_raw_stage_valid = true;
+}
+
+MbIrTxSupply mb_ir_tx_raw_supply(const uint32_t** timings, uint16_t* count) {
+    MbIrTxRawState* s = ir_tx_raw_active;
+    if(s == NULL || s->supplied >= 1) {
+        if(s != NULL) s->exhausted = true;
+        return MB_IR_TX_STOP;
+    }
+    if(timings != NULL) *timings = s->timings;
+    if(count != NULL) *count = s->count;
+    s->supplied++;
+    return MB_IR_TX_NEW;
+}
+
+void mb_ir_tx_raw_on_sent(void) {
+    MbIrTxRawState* s = ir_tx_raw_active;
+    if(s != NULL) s->sent++;
+}
+
+static MbStatus ir_tx_raw_validate_fn(const void* params) {
+    MbStatus s;
+    if(!ir_hal_bound || ir_hal.tx_start == NULL || ir_hal.tx_stop == NULL) {
+        return MB_INVALID_ARGUMENT;
+    }
+    return mb_ir_tx_raw_validate_params(params, &s) ? MB_OK : s;
+}
+
+static MbStatus ir_tx_raw_start(MbJobContext* job, const void* params) {
+    MbIrTxRawState* s = job->module_state;
+    const MbIrTxRawParams* p = params;
+    if(s == NULL || p == NULL || !ir_hal_bound) return MB_INIT_FAILED;
+    if(!ir_tx_raw_stage_valid) return MB_INIT_FAILED;
+    s->params = *p;
+    memcpy(s->timings, ir_tx_raw_stage_buf, (size_t)ir_tx_raw_stage_count * sizeof(uint32_t));
+    s->count = ir_tx_raw_stage_count;
+    ir_tx_raw_stage_valid = false; /* staged data is single-use */
+    ir_tx_raw_active = s;
+    if(ir_tx_raw_bound && ir_tx_raw_bind.pin != NULL) {
+        if(!ir_tx_raw_bind.pin(ir_tx_raw_bind.ctx, p->object_id)) {
+            ir_tx_raw_active = NULL;
+            return MB_INIT_FAILED;
+        }
+        s->pinned = true;
+    }
+    if(!ir_hal.tx_start(ir_hal.ctx)) {
+        if(s->pinned && ir_tx_raw_bind.unpin != NULL) {
+            ir_tx_raw_bind.unpin(ir_tx_raw_bind.ctx, p->object_id);
+            s->pinned = false;
+        }
+        ir_tx_raw_active = NULL;
+        return MB_INIT_FAILED;
+    }
+    s->worker_on = true;
+    return MB_OK;
+}
+
+static void ir_tx_raw_service(MbJobContext* job, uint32_t now) {
+    MbIrTxRawState* s = job->module_state;
+    if(!s->anchored) {
+        s->anchored = true;
+        s->t0 = now;
+    }
+    if(s->exhausted) {
+        s->finished = true;
+        job->done = true;
+        job->done_status = MB_OK;
+        return;
+    }
+    if((uint32_t)(now - s->t0) >= s->params.timeout_ms) {
+        job->done = true;
+        job->done_status = MB_TIMEOUT;
+    }
+}
+
+static void ir_tx_raw_request_stop(MbJobContext* job, MbStopReason reason) {
+    (void)reason;
+    MbIrTxRawState* s = job->module_state;
+    if(s != NULL) s->stop_seen = true;
+}
+
+static MbCleanupResult ir_tx_raw_cleanup(MbJobContext* job) {
+    MbIrTxRawState* s = job->module_state;
+    if(s == NULL) return MB_CLEAN_OK;
+    bool joined = false;
+    if(ir_hal_bound && s->worker_on) {
+        ir_hal.tx_stop(ir_hal.ctx);
+        s->worker_on = false;
+        joined = true;
+    }
+    ir_tx_raw_summary.supplied = s->supplied;
+    ir_tx_raw_summary.sent = s->sent;
+    if(s->finished && joined && ir_tx_raw_summary.sent < ir_tx_raw_summary.supplied) {
+        ir_tx_raw_summary.sent = ir_tx_raw_summary.supplied;
+    }
+    if(s->finished) ir_tx_raw_summary.tx_total++;
+    if(s->pinned && ir_tx_raw_bound && ir_tx_raw_bind.unpin != NULL) {
+        ir_tx_raw_bind.unpin(ir_tx_raw_bind.ctx, s->params.object_id);
+        s->pinned = false;
+    }
+    ir_tx_raw_active = NULL;
+    return MB_CLEAN_OK;
+}
+
+const MbModule mb_module_ir_tx_raw = {
+    .validate = ir_tx_raw_validate_fn,
+    .ctx_size = sizeof(MbIrTxRawState),
+    .start = ir_tx_raw_start,
+    .service = ir_tx_raw_service,
+    .request_stop = ir_tx_raw_request_stop,
+    .cleanup = ir_tx_raw_cleanup,
+};
