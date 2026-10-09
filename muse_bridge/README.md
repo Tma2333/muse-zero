@@ -43,9 +43,12 @@ time can:
 - capture a raw infrared waveform into a bounded, CRC-checked
   object, read it back in pages, and replay it the same finite
   way; partially transferred objects can never transmit,
-- hear and see listening state from the device itself: a double
-  beep opens and closes every listening period and the LED
-  flashes while it lasts,
+- discover which NFC protocols are nearby, and identify an
+  ISO14443-3A card — UID, ATQA, SAK — without reading card
+  content or emulating anything,
+- hear and see listening state from the device itself: the LED
+  flashes while it listens, one beep lands when a signal does,
+  red flashes mark a listening job that ended badly,
 - ask what actually happened: cancellation, absolute deadlines, and a
   diagnostic trace readable over the wire.
 

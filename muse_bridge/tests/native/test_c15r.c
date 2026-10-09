@@ -12,6 +12,11 @@ static int groups;
 #define GROUP(name) do { groups++; printf("ok %d - %s\n", groups, name); } while(0)
 
 static int hal_rx_starts, hal_rx_stops, hal_tx_starts, hal_tx_stops;
+static int hook_calls;
+static void fake_received_hook(void* ctx) {
+    (void)ctx;
+    hook_calls++;
+}
 static bool hal_fail_raw_start;
 static int pin_calls, unpin_calls;
 static bool pin_fail;
@@ -47,6 +52,7 @@ int main(void) {
         .tx_stop = fake_tx_stop,
         .ctx = NULL};
     mb_ir_module_bind(&hal);
+    mb_ir_set_received_hook(fake_received_hook, NULL);
     MbIrTxRawBind bind = {.pin = fake_pin, .unpin = fake_unpin, .ctx = NULL};
     mb_ir_tx_raw_bind(&bind);
 
@@ -222,6 +228,36 @@ int main(void) {
         free(s2);
     }
     GROUP("raw tx staging/pin guards");
+
+    /* 10: v2 received hook — fires once on a usable capture,
+     * never on over-cap */
+    {
+        MbJobContext job = {0};
+        MbIrRawRxState* s = calloc(1, sizeof(MbIrRawRxState));
+        job.module_state = s;
+        MbIrRawParams p = {.timeout_ms = 5000};
+        CHECK(mb_module_ir_raw_rx.start(&job, &p) == MB_OK);
+        uint32_t wave[10] = {0};
+        mb_ir_raw_on_timings(wave, 10);
+        hook_calls = 0;
+        mb_module_ir_raw_rx.service(&job, 100);
+        CHECK(job.done && hook_calls == 1);
+        CHECK(mb_module_ir_raw_rx.cleanup(&job) == MB_CLEAN_OK);
+        free(s);
+
+        MbJobContext job2 = {0};
+        MbIrRawRxState* s2 = calloc(1, sizeof(MbIrRawRxState));
+        job2.module_state = s2;
+        CHECK(mb_module_ir_raw_rx.start(&job2, &p) == MB_OK);
+        static uint32_t big[600];
+        mb_ir_raw_on_timings(big, 600);
+        mb_module_ir_raw_rx.service(&job2, 100);
+        CHECK(job2.done && job2.done_status == MB_OVERFLOW);
+        CHECK(hook_calls == 1); /* over-cap: no "got it" beep */
+        CHECK(mb_module_ir_raw_rx.cleanup(&job2) == MB_CLEAN_OK);
+        free(s2);
+    }
+    GROUP("v2 received hook");
 
     printf("PASS test_c15r (%d groups)\n", groups);
     return 0;

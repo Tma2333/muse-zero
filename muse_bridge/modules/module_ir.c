@@ -18,6 +18,18 @@ void mb_ir_module_bind(const MbIrHal* hal) {
     ir_hal_bound = hal != NULL;
 }
 
+static void (*ir_received_hook)(void* ctx);
+static void* ir_received_hook_ctx;
+
+void mb_ir_set_received_hook(void (*fn)(void* ctx), void* ctx) {
+    ir_received_hook = fn;
+    ir_received_hook_ctx = ctx;
+}
+
+static void ir_fire_received(void) {
+    if(ir_received_hook != NULL) ir_received_hook(ir_received_hook_ctx);
+}
+
 bool mb_ir_validate_params(const MbIrParams* params, MbStatus* out_status) {
     MbStatus s = MB_OK;
     if(params == NULL || params->protocol_filter != MB_IR_PROTOCOL_NEC ||
@@ -91,6 +103,10 @@ static void ir_service(MbJobContext* job, uint32_t now) {
             /* pool full: executor counts its own drops; the hole is
              * visible to the host through event_seq */
         }
+    }
+    if(s->decoded > 0 && !s->rx_signaled) {
+        s->rx_signaled = true;
+        ir_fire_received(); /* v2: beep = first frame landed */
     }
     if((uint32_t)(now - s->t0) >= s->params.timeout_ms) {
         job->done = true;
@@ -308,6 +324,12 @@ static void ir_raw_service(MbJobContext* job, uint32_t now) {
         s->t0 = now;
     }
     if(s->have) {
+        /* v2: beep only for a usable capture; over-cap ends in the
+         * app-side error flash instead. */
+        if(s->count <= MB_IR_OBJ_TIMING_CAP && !s->rx_signaled) {
+            s->rx_signaled = true;
+            ir_fire_received();
+        }
         job->done = true;
         /* Over-cap is an explicit terminal, never a silent truncate
          * (plan section 8); within-cap captures complete OK and the

@@ -14,7 +14,8 @@ import time
 
 import serial
 
-sys.path.insert(0, os.environ.get("FLIPPER_RPC_DIR", os.path.expanduser("~/flipper-rpc")))
+sys.path.insert(
+    0, os.environ.get("FLIPPER_RPC_DIR", os.path.expanduser("~/flipper-rpc")))
 import bridge_codec as bc
 
 ZERO16 = bytes(16)
@@ -743,8 +744,9 @@ def case_c08(link):
 
 
 def case_back(link):
-    """Manual proof: a 60 s job runs under a live lease; the operator presses
-    Back on the Flipper; the app must stop the job and exit promptly."""
+    """Manual proof: a 60 s job runs under a live lease; the operator
+    presses Back on the Flipper; the app must stop the job and exit
+    promptly."""
     ident = handshake_a(link, NONCE_1)
     check("back_session", ident is not None, "")
     if ident is None:
@@ -1870,6 +1872,7 @@ def case_c13(link):
 OP_RX_RAW, OP_TX_RAW = 0x0410, 0x0411
 OP_OBJ_BEGIN, OP_OBJ_CHUNK, OP_OBJ_COMMIT = 0x0901, 0x0902, 0x0903
 OP_OBJ_READ_Q, OP_OBJ_RELEASE = 0x0904, 0x0905
+OP_NFC_SCAN, OP_NFC_IDENTIFY = 0x0501, 0x0502
 S_OVERFLOW_C15 = 17
 
 
@@ -2008,7 +2011,7 @@ def case_c15(link):
             return
 
         # Build identity on the new firmware.
-        link.send_id(ZERO16, ZERO16, 0, bc.T_QUERY, 0x0002, 991, b"")
+        link.send_id(ZERO16, ZERO16, 0, bc.T_QUERY, 0x0002, 991, bytes([0]))
         info = link.wait_frame(991, timeout=5.0)
         check("c15_build", info is not None
               and b"mb-0.12-c15-2" in info.payload,
@@ -2531,6 +2534,417 @@ def case_c15w(link):
         echo.stop()
 
 
+def nfc_scan_summary(f):
+    """COMPLETE payload -> (mapped list, unmapped count) or None."""
+    if f is None or f.type != 12 or len(f.payload) < 3:
+        return None
+    count = f.payload[2]
+    mapped = []
+    off = 3
+    for _ in range(count):
+        if off + 2 > len(f.payload):
+            return None
+        mapped.append(struct.unpack_from("<H", f.payload, off)[0])
+        off += 2
+    if off >= len(f.payload):
+        return None
+    return mapped, f.payload[off]
+
+
+def nfc_id_summary(f):
+    """COMPLETE payload (21 bytes) -> dict or None."""
+    if f is None or f.type != 12 or len(f.payload) != 21:
+        return None
+    p = f.payload
+    return {
+        "found": p[2],
+        "protocol": struct.unpack_from("<H", p, 3)[0],
+        "uid_len": p[5],
+        "uid": bytes(p[6:16]),
+        "atqa": bytes(p[16:18]),
+        "sak": p[18],
+        "errs": struct.unpack_from("<H", p, 19)[0],
+    }
+
+
+def case_c16a(link):
+    """C16A (self-contained): build + caps, request-shape refusals,
+    and honest empty windows with no card anywhere near the bench."""
+    seq = [0]
+
+    def next_seq():
+        seq[0] += 1
+        return seq[0]
+
+    nonce = (0xC160A001).to_bytes(16, "little")
+    # Build identity BEFORE the handshake: a bootstrap query, and
+    # immune to stale post-handshake frames sharing the correlation.
+    link.send_id(ZERO16, ZERO16, 0, bc.T_QUERY, 0x0002, 991, bytes([0]))
+    info = link.wait_frame(991, timeout=5.0)
+    check("c16a_build", info is not None
+          and b"mb-0.13-c16-1" in info.payload,
+          repr(info.payload[:80]) if info else "no info")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    try:
+        check("c16a_session", ident is not None, repr(ident))
+        if ident is None:
+            return
+        by_op = {}
+        cursor = 0
+        for _ in range(4):
+            link.send_id(ZERO16, ZERO16, 0, bc.T_QUERY,
+                         OP_GET_CAPABILITIES_C12, 990,
+                         struct.pack("<H", cursor))
+            caps = link.wait_frame(990, timeout=5.0)
+            if caps is None or len(caps.payload) < 4:
+                break
+            nxt = struct.unpack_from("<H", caps.payload, 1)[0]
+            body = caps.payload[4:]
+            for i in range(len(body) // 7):
+                o, k, lim = struct.unpack_from("<HBI", body, i * 7)
+                by_op[o] = (k, lim)
+            if nxt == 0xFFFF:
+                break
+            cursor = nxt
+        check("caps_0x0501", by_op.get(OP_NFC_SCAN) == (1, 60000),
+              repr(by_op.get(OP_NFC_SCAN)))
+        check("caps_0x0502", by_op.get(OP_NFC_IDENTIFY) == (1, 60000),
+              repr(by_op.get(OP_NFC_IDENTIFY)))
+
+        # Refusals: unsupported protocol, zero protocol, bad shapes.
+        # All consumed INVALID_ARGUMENT in the RESULT frame header.
+        for name, op, payload in (
+            ("proto2", OP_NFC_IDENTIFY, struct.pack("<HI", 2, 5000)),
+            ("proto0", OP_NFC_IDENTIFY, struct.pack("<HI", 0, 5000)),
+            ("tmo0", OP_NFC_IDENTIFY, struct.pack("<HI", 1, 0)),
+            ("short", OP_NFC_IDENTIFY, struct.pack("<H", 1)),
+            ("scan_short", OP_NFC_SCAN, b"\x01\x02"),
+            ("scan_tmo0", OP_NFC_SCAN, struct.pack("<I", 0)),
+        ):
+            s = next_seq()
+            send_req(link, ident, s, payload, op=op)
+            f = link.wait_frame(s, timeout=5.0)
+            check(f"c16a_refuse_{name}",
+                  f is not None and f.type == 9 and f.status == S_INVAL,
+                  repr(f))
+
+        # No card: scan completes an honest empty window.
+        s = next_seq()
+        send_req(link, ident, s, struct.pack("<I", 4000), op=OP_NFC_SCAN)
+        f = action_outcome(link, s, timeout=9.0)
+        ss = nfc_scan_summary(f)
+        check("c16a_scan_nocard", f is not None
+              and result_status(f) == S_OK and ss == ([], 0), repr(ss))
+
+        # No card: identify completes found=0 with a zeroed record.
+        s = next_seq()
+        send_req(link, ident, s, struct.pack("<HI", 1, 4000),
+                 op=OP_NFC_IDENTIFY)
+        f = action_outcome(link, s, timeout=9.0)
+        ids = nfc_id_summary(f)
+        check("c16a_identify_nocard", f is not None
+              and result_status(f) == S_OK and ids is not None
+              and ids["found"] == 0 and ids["uid_len"] == 0
+              and ids["uid"] == bytes(10) and ids["sak"] == 0,
+              repr(ids))
+    finally:
+        echo.stop()
+
+
+def case_c16b(link):
+    """C16B (bench): the S50 fixture on the v2 signal choreography.
+    LED flashing = place/hold the card on the Flipper's back; beep =
+    it landed; flashing stops after the beep. Phases: (1) scan +
+    identify with card; (2) 8 s pause — operator removes the card;
+    (3) removal rows must find nothing; (4) cancel a long scan, then
+    a final identify with the card placed again proves the NFC
+    stack is reusable. Expected UID via BC_EXPECT_UID (hex); ATQA
+    and SAK are the MIFARE Classic 1K constants."""
+    import os
+
+    seq = [0]
+
+    def next_seq():
+        seq[0] += 1
+        return seq[0]
+
+    nonce = (0xC160B002).to_bytes(16, "little")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    try:
+        check("c16b_session", ident is not None, repr(ident))
+        if ident is None:
+            return
+        expect_uid = os.environ.get("BC_EXPECT_UID", "")
+        expect = bytes.fromhex(expect_uid) if expect_uid else None
+
+        def identify(timeout_ms=20000):
+            s = next_seq()
+            send_req(link, ident, s, struct.pack("<HI", 1, timeout_ms),
+                     op=OP_NFC_IDENTIFY)
+            return action_outcome(link, s, timeout=timeout_ms / 1000 + 6)
+
+        # Phase 1: card on the signal.
+        s = next_seq()
+        send_req(link, ident, s, struct.pack("<I", 20000), op=OP_NFC_SCAN)
+        f = action_outcome(link, s, timeout=26.0)
+        ss = nfc_scan_summary(f)
+        check("c16b_scan_card", f is not None
+              and result_status(f) == S_OK and ss is not None
+              and ss[0] == [1] and ss[1] == 0, repr(ss))
+        f = identify()
+        ids = nfc_id_summary(f)
+        ok = (f is not None and result_status(f) == S_OK
+              and ids is not None and ids["found"] == 1
+              and ids["protocol"] == 1 and ids["uid_len"] == 4
+              and ids["atqa"] == b"\x04\x00" and ids["sak"] == 0x08)
+        if expect is not None:
+            ok = ok and ids["uid"][:4] == expect
+        check("c16b_identify_card", ok, repr(ids))
+        uid_seen = ids["uid"][:4] if ids else None
+
+        # Phase 2: operator removes the card.
+        time.sleep(8.0)
+
+        # Phase 3: removal — nothing may be retained.
+        s = next_seq()
+        send_req(link, ident, s, struct.pack("<I", 4000), op=OP_NFC_SCAN)
+        f = action_outcome(link, s, timeout=9.0)
+        ss = nfc_scan_summary(f)
+        check("c16b_scan_removed", ss == ([], 0), repr(ss))
+        f = identify(4000)
+        ids = nfc_id_summary(f)
+        check("c16b_identify_removed", ids is not None
+              and ids["found"] == 0 and ids["uid"] == bytes(10),
+              repr(ids))
+
+        # Phase 4: cancel a long scan mid-window (no card), then the
+        # stack must still work — card placed again on the flash.
+        s = next_seq()
+        send_req(link, ident, s, struct.pack("<I", 30000), op=OP_NFC_SCAN)
+        f = link.wait_frame(s, timeout=5.0)  # ACCEPTED
+        check("c16b_cancel_accepted", f is not None and f.type == 10,
+              repr(f))
+        time.sleep(2.0)
+        f2 = send_cancel(link, ident, 977, s)
+        f = action_outcome(link, s, timeout=8.0)
+        check("c16b_cancel_terminal", f is not None and f.type == 12
+              and result_status(f) == 15, repr(f))  # 15 = CANCELLED
+        f = identify()
+        ids = nfc_id_summary(f)
+        check("c16b_identify_after_cancel", ids is not None
+              and ids["found"] == 1 and ids["uid"][:4] == uid_seen,
+              repr(ids))
+    finally:
+        echo.stop()
+
+
+def case_c16b2(link):
+    """C16B2 (bench): removal + cancel, deterministically. Starts
+    where C16B phase 1 ended conceptually: identify WITH the card
+    (session-local live read), then a GREEN flash is the operator
+    cue to remove the card and keep it away — the following
+    windows must find nothing, and a long scan with no card in
+    the field stays open long enough for the cancel to land."""
+    seq = [0]
+
+    def next_seq():
+        seq[0] += 1
+        return seq[0]
+
+    nonce = (0xC160B202).to_bytes(16, "little")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    try:
+        check("c16b2_session", ident is not None, repr(ident))
+        if ident is None:
+            return
+
+        def identify(timeout_ms):
+            s = next_seq()
+            send_req(link, ident, s, struct.pack("<HI", 1, timeout_ms),
+                     op=OP_NFC_IDENTIFY)
+            return action_outcome(link, s, timeout=timeout_ms / 1000 + 6)
+
+        # Live read in this session (card placed on the flash).
+        f = identify(20000)
+        ids = nfc_id_summary(f)
+        check("c16b2_identify_card", ids is not None
+              and ids["found"] == 1 and ids["uid_len"] == 4
+              and ids["atqa"] == b"\x04\x00" and ids["sak"] == 0x08,
+              repr(ids))
+        # Transition cue: THREE green blinks (1-byte NOTIFY payloads
+        # — the 5-byte form was INVALID_ARGUMENT, run 1-3's silent
+        # killer), then a 12 s dark gap. Each notify is VERIFIED.
+        cue_ok = True
+        for _ in range(3):
+            s = next_seq()
+            send_req(link, ident, s, bytes([1]), op=OP_NOTIFY)
+            f = action_outcome(link, s, timeout=5.0)
+            cue_ok = cue_ok and f is not None and f.type == 12
+            time.sleep(0.4)
+        check("c16b2_removal_cue", cue_ok, "")
+        time.sleep(12.0)
+        # Removal: nothing may be found or retained.
+        s = next_seq()
+        send_req(link, ident, s, struct.pack("<I", 4000), op=OP_NFC_SCAN)
+        f = action_outcome(link, s, timeout=9.0)
+        check("c16b2_scan_removed", nfc_scan_summary(f) == ([], 0),
+              repr(nfc_scan_summary(f)))
+        f = identify(4000)
+        ids = nfc_id_summary(f)
+        check("c16b2_identify_removed", ids is not None
+              and ids["found"] == 0 and ids["uid"] == bytes(10),
+              repr(ids))
+        # Cancel a genuinely open window (no card -> no early exit).
+        s = next_seq()
+        send_req(link, ident, s, struct.pack("<I", 30000), op=OP_NFC_SCAN)
+        f = link.wait_frame(s, timeout=5.0)
+        check("c16b2_cancel_accepted", f is not None and f.type == 10,
+              repr(f))
+        time.sleep(2.0)
+        send_cancel(link, ident, 977, s)
+        f = action_outcome(link, s, timeout=8.0)
+        check("c16b2_cancel_terminal", f is not None and f.type == 12
+              and result_status(f) == 15, repr(f))  # 15 = CANCELLED
+        # Stack reusable immediately after the cancel.
+        f = identify(4000)
+        ids = nfc_id_summary(f)
+        check("c16b2_identify_after_cancel", ids is not None
+              and ids["found"] == 0, repr(ids))
+    finally:
+        echo.stop()
+
+
+def case_c16r(link):
+    """C16R (bench, pressure-free): within-session removal + cancel.
+    Phase 1: identify the parked card. The case then WAITS for the
+    flag file /tmp/mb_go (created by the operator's chat message,
+    up to 5 minutes — no timing pressure) while the card is taken
+    away. Phase 2: identify must find nothing; a 30 s scan (field
+    empty, window genuinely open) is cancelled mid-flight; a
+    final identify proves the stack cycles after a cancel."""
+    seq = [0]
+
+    def next_seq():
+        seq[0] += 1
+        return seq[0]
+
+    nonce = (0xC160B304).to_bytes(16, "little")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    try:
+        check("c16r_session", ident is not None, repr(ident))
+        if ident is None:
+            return
+
+        def identify(timeout_ms):
+            s = next_seq()
+            send_req(link, ident, s, struct.pack("<HI", 1, timeout_ms),
+                     op=OP_NFC_IDENTIFY)
+            return action_outcome(link, s, timeout=timeout_ms / 1000 + 6)
+
+        f = identify(20000)
+        ids = nfc_id_summary(f)
+        check("c16r_identify_card", ids is not None
+              and ids["found"] == 1 and ids["uid_len"] == 4
+              and ids["atqa"] == b"\x04\x00" and ids["sak"] == 0x08,
+              repr(ids))
+        flag = "/tmp/mb_go"
+        waited = 0.0
+        while not os.path.exists(flag) and waited < 300.0:
+            time.sleep(2.0)
+            waited += 2.0
+        check("c16r_flag", os.path.exists(flag), f"waited={waited:.0f}s")
+        if os.path.exists(flag):
+            os.unlink(flag)
+        time.sleep(3.0)  # let the card get well clear of the field
+        f = identify(5000)
+        ids = nfc_id_summary(f)
+        check("c16r_identify_removed", ids is not None
+              and ids["found"] == 0 and ids["uid"] == bytes(10),
+              repr(ids))
+        s = next_seq()
+        send_req(link, ident, s, struct.pack("<I", 30000), op=OP_NFC_SCAN)
+        f = link.wait_frame(s, timeout=5.0)
+        check("c16r_cancel_accepted", f is not None and f.type == 10,
+              repr(f))
+        time.sleep(2.0)
+        send_cancel(link, ident, 977, s)
+        f = action_outcome(link, s, timeout=8.0)
+        check("c16r_cancel_terminal", f is not None and f.type == 12
+              and result_status(f) == 15, repr(f))  # 15 = CANCELLED
+        f = identify(5000)
+        ids = nfc_id_summary(f)
+        check("c16r_identify_after_cancel", ids is not None
+              and ids["found"] == 0, repr(ids))
+    finally:
+        echo.stop()
+
+
+def case_c16t(link):
+    """C16T: 100 identify cycles against the parked S50 (operator
+    parks the card on the reader and leaves it). SIGNALS_OFF first
+    so the bench stays dark and quiet; every cycle must find the
+    same UID. Heap proof lands in result.txt at app exit."""
+    seq = [0]
+
+    def next_seq():
+        seq[0] += 1
+        return seq[0]
+
+    nonce = (0xC1607003).to_bytes(16, "little")
+    ident = handshake_a(link, nonce)
+    echo = EchoThread(link)
+    echo.start()
+    try:
+        check("c16t_session", ident is not None, repr(ident))
+        if ident is None:
+            return
+        # SIGNALS_OFF (effect 7), VERIFIED — run 1 sent a 5-byte
+        # payload (INVALID_ARGUMENT) so it flashed throughout.
+        s = next_seq()
+        send_req(link, ident, s, bytes([7]), op=OP_NOTIFY)
+        f = action_outcome(link, s, timeout=5.0)
+        check("c16t_signals_off", f is not None and f.type == 12,
+              repr(f))
+        uid0 = None
+        good = 0
+        miss_reasons = []
+        for i in range(100):
+            s = next_seq()
+            send_req(link, ident, s, struct.pack("<HI", 1, 8000),
+                     op=OP_NFC_IDENTIFY)
+            f = action_outcome(link, s, timeout=12.0)
+            ids = nfc_id_summary(f)
+            if ids is not None and ids["found"] == 1:
+                if uid0 is None:
+                    uid0 = ids["uid"][:4]
+                if ids["uid"][:4] == uid0:
+                    good += 1
+                else:
+                    miss_reasons.append(f"uid={ids['uid'][:4]!r}")
+            elif ids is not None:
+                miss_reasons.append(
+                    f"found=0 errs={ids['errs']} cycle={i}")
+            else:
+                miss_reasons.append(f"frame={f!r} cycle={i}")
+        check("c16t_100_cycles", good == 100,
+              f"{good}/100 uid={uid0} misses={miss_reasons[:20]}")
+        s = next_seq()
+        send_req(link, ident, s, bytes([8]), op=OP_NOTIFY)
+        f = action_outcome(link, s, timeout=5.0)
+        check("c16t_signals_on", f is not None and f.type == 12,
+              repr(f))
+    finally:
+        echo.stop()
+
+
 def case_c14l(link):
     """C14L (L02 on a real module): drop the ACCEPTED of a running IR
     RX job, retry the identical request — the firmware replays
@@ -2819,8 +3233,9 @@ def case_c14_l21b(link):
 
 
 def case_c10b(link):
-    """Manual proof: a claimed-high pin under a LIVE lease; the operator
-    presses Back; the exit path restores the pin (observed on the Pi)."""
+    """Manual proof: a claimed-high pin under a LIVE lease; the
+    operator presses Back; the exit path restores the pin (observed
+    on the Pi)."""
     obs = Observer()
     ident = handshake_a(link, NONCE_1)
     check("c10b_session", ident is not None, "")
@@ -2888,6 +3303,16 @@ def main():
             case_c15c(link)
         elif args.case == "C15W":
             case_c15w(link)
+        elif args.case == "C16A":
+            case_c16a(link)
+        elif args.case == "C16B":
+            case_c16b(link)
+        elif args.case == "C16B2":
+            case_c16b2(link)
+        elif args.case == "C16R":
+            case_c16r(link)
+        elif args.case == "C16T":
+            case_c16t(link)
         elif args.case == "C14L":
             case_c14l(link)
         elif args.case == "C14G":

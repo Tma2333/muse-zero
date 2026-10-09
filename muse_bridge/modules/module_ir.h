@@ -54,6 +54,7 @@ typedef struct {
     /* Decoded accounting (callback-maintained counters are volatile:
      * the producer is the platform worker thread). */
     uint32_t decoded; /* qualified frames seen */
+    bool rx_signaled; /* v2 received hook already fired for this job */
     uint32_t ring_dropped; /* ring was full at decode time */
     uint32_t stranded; /* still queued when the job ended */
     uint32_t emitted; /* handed to the job data pool */
@@ -66,6 +67,11 @@ typedef struct {
 extern const MbModule mb_module_ir;
 
 void mb_ir_module_bind(const MbIrHal* hal);
+
+/* Bench signals v2: the integrator's hook fires on the executor
+ * thread at the first intended signal (decoded RX: first frame
+ * drained; raw RX: first within-cap capture). Beep = "got it". */
+void mb_ir_set_received_hook(void (*fn)(void* ctx), void* ctx);
 
 /* Final accounting of the most recently finished RX job, snapshotted
  * at cleanup (the executor frees per-job state right after). */
@@ -171,6 +177,7 @@ typedef struct {
     bool anchored;
     bool stop_seen;
     bool worker_on;
+    bool rx_signaled; /* v2 received hook already fired for this job */
     volatile bool have; /* a burst was staged */
     volatile uint32_t count; /* worker's full timing count */
     uint32_t stage[MB_IR_RAW_STAGE_MAX];

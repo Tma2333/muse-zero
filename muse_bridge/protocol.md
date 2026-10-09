@@ -309,31 +309,40 @@ separate channel: an independent receiver (Pi GPIO + VS1838,
 `tools/witness_ir.py`) counts the frames that actually left the LED,
 and the C13 gate compares that count against the admissions.
 
-## Notifications — bench signals (2026-10-08)
+## Notifications — bench signals (v2, 2026-10-08)
 
 Effects 4–8 (op 0x0301) generalize the notification module into the
 bridge's device-signal surface, operator-designed: the hardware
 itself announces state, so a human at the bench never has to infer
-timing from a chat message.
+timing from a chat message. (v1 — double-beep at open and close —
+shipped in the C15 build and was superseded the same day.)
 
-- `DOUBLE_BEEP` (4): two 100 ms notes with a 50 ms gap — the
-  start/end marker. Explicit actions always play.
+- `DOUBLE_BEEP` (4): two 100 ms notes with a 50 ms gap. Explicit
+  actions always play — the mute gate covers only AUTOMATIC
+  annunciation.
 - `LISTEN_ON` (5) / `LISTEN_OFF` (6): drive the listening
   indicator. While anything is listening (flag set), the main loop
   flashes the blue LED about once a second; the blink sequence
   extinguishes itself, so clearing the flag needs no LED cleanup.
-- `SIGNALS_OFF` (7) / `SIGNALS_ON` (8): mute/unmute the AUTOMATIC
-  job signals only (long cycle tests run SIGNALS_OFF first).
+- `SIGNALS_OFF` (7) / `SIGNALS_ON` (8): mute/unmute ALL automatic
+  annunciation (long cycle tests run SIGNALS_OFF first).
 
-Automatic signals: every hardware-listening job plays DOUBLE_BEEP
-as its receiver opens (the beeps finish, then listening starts)
-and again when it closes (capture, timeout, or cancel — always
-after the receiver stops), and sets the listening flag for its
-whole run. IR RX (decoded and raw) implements this today; NFC, LF
-RFID, and Sub-GHz receive jobs inherit the same hooks. The flag is
-the truth about listening — like a webcam light — and the mute
-gate silences only the annunciation, never the flag's meaning for
-jobs that set it.
+Automatic signals (v2): listening starts SILENT — the flashing
+blue LED is the only "I am listening" signal, like a webcam light.
+A single short beep fires ONLY at the moment the intended signal
+is received ("got it") — its only meaning. A clean close,
+including an empty window, is silent. A listening job that ends
+abnormally (error status, OVERFLOW, host cancel, lease loss)
+flashes the red LED three times during exit. Received hooks:
+IR decoded (first drained frame), IR raw (first within-cap
+capture — over-cap never beeps), NFC (first candidate list /
+first valid identify record). The flag is the truth about
+listening; the mute gate silences annunciation, never the flag.
+
+Harness note (learned the hard way at C16): the NOTIFY request
+payload is exactly ONE byte (the effect). A longer payload is a
+consumed INVALID_ARGUMENT and the cue silently never plays —
+cases must verify their signal actions COMPLETE.
 
 ## Raw IR + bounded objects (C15, ops 0x0410/0x0411, 0x0901–0x0905)
 
@@ -407,3 +416,36 @@ Qualification: `evidence/C15-raw-ir-2026-10-08.md`. Note for
 witness design: a witness armed while the operator is pressing a
 remote hears the operator too — witness windows for TX verdicts
 must be armed after the operator's part ends (see the C15W case).
+
+## NFC discovery + identify (C16, ops 0x0501/0x0502)
+
+Design: `docs/c16-nfc-design.md` (plan §10.6 steps A+B, §22.3,
+§22.4). Discovery and identification only — no card content read
+(step C), no emulation (step D). One `Nfc*` per job, allocated
+and freed in the glue on the executor thread; scanner and poller
+never coexist.
+
+- `NFC_SCAN` (action, op 0x0501) `timeout_ms:u32` (1–60000).
+  Runs the protocol scanner and reports CANDIDATES, not a card:
+  each raw `NfcProtocol` is translated by ancestry
+  (`nfc_protocol_has_parent(p, NfcProtocolIso14443_3a)`) to the
+  portable id 1 or 0 (unmapped). Raw enum values never cross the
+  seam; unmapped candidates are counted, never used as allocation
+  parameters. First detection wins. Summary: `status:u16,
+  mapped_count:u8, mapped[]:u16 each, unmapped_count:u8` —
+  deduped, detection order, cap 4. An empty window is an OK
+  completion with zero counts.
+- `NFC_IDENTIFY` (action, op 0x0502) `protocol:u16,
+  timeout_ms:u32`. Protocol must be 1 (ISO14443-3A); anything
+  else is a consumed INVALID_ARGUMENT, refused BEFORE any NFC
+  allocation. Summary (fixed 21 bytes): `status:u16, found:u8,
+  protocol:u16, uid_len:u8, uid[10], atqa[2], sak:u8,
+  error_events:u16`. UID lengths other than 4/7/10 are discarded
+  and counted as error events; ATQA is carried in storage order,
+  never reinterpreted. found=0 ⇒ every data field zero. Poller
+  Error events are non-fatal and counted (a cardless field
+  produces ~10/sec — platform retry behavior, diagnostic only).
+
+Qualification: `evidence/C16-nfc-2026-10-08.md` (S50 fixture,
+byte-identical identify vs the stock app; within-session
+removal; mid-window cancel; 100/100 cycles).

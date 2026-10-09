@@ -45,6 +45,7 @@ run test_c12 test_c12.c $ROOT/modules/module_ir.c $ROOT/core/bridge_executor.c $
 run test_c13 test_c13.c $ROOT/modules/module_ir.c $ROOT/core/bridge_executor.c $ROOT/core/bridge_core.c
 run test_c15 test_c15.c $ROOT/modules/module_object.c $ROOT/core/bridge_core.c
 run test_c15r test_c15r.c $ROOT/modules/module_ir.c $ROOT/core/bridge_executor.c $ROOT/core/bridge_core.c
+run test_c16 test_c16.c $ROOT/modules/module_nfc.c $ROOT/core/bridge_executor.c $ROOT/core/bridge_core.c
 
 if [ $FAIL -eq 0 ]; then echo "NATIVE SUITE: ALL PASS"; else echo "NATIVE SUITE: FAILURES PRESENT"; fi
 exit $FAIL

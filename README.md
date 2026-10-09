@@ -26,12 +26,12 @@ of running twice), and hard stops for anything that transmits.
 Today, on stock Flipper firmware:
 
 - **Sense** — read GPIO pins and analog voltages, receive and decode
-  infrared remote signals
+  infrared remote signals, discover and identify NFC cards
 - **Signal** — short, finite notifications: an LED flash, a beep, a buzz
 - **Stay safe doing it** — every hardware claim is verified against a
   physical observer before it joins the feature list
 
-Coming, each as its own verified module: NFC and RFID reading, iButton,
+Coming, each as its own verified module: RFID reading, iButton,
 Sub-GHz listening, and the Pi-side workflow layer that lets Muse run
 multi-step physical procedures.
 
@@ -90,13 +90,16 @@ advertised capability list. Release history: [CHANGELOG.md](CHANGELOG.md).
 - [x] Raw IR: capture a real remote's timing waveform into a
       bounded object, replay it as one finite train — captured and
       uploaded waveforms both proven against the bench receiver
-- [x] Bench signals: the device announces listening state itself
-      (double beep at open/close, flashing LED while listening), so
-      a human at the bench never has to guess test timing
+- [x] Bench signals: the device announces listening state itself —
+      flashing LED while listening, one beep the moment a signal
+      lands, red flashes if a listening job ends badly — so a human
+      at the bench never has to guess test timing
+- [x] NFC discovery and identification: scan reports which card
+      protocols are near; identify returns an ISO14443-3A card's
+      UID, ATQA, and SAK (no content read, no emulation)
 
 **Next**
 
-- [ ] NFC discovery and card identification
 - [ ] LF RFID read
 - [ ] Sub-GHz receive: signal strength, then one decoded format
 - [ ] Scoped file storage transfers

@@ -28,6 +28,12 @@
 #include <notification/notification.h>
 #include <notification/notification_messages.h>
 #include <infrared_worker.h>
+#include <nfc/nfc.h>
+#include <nfc/nfc_scanner.h>
+#include <nfc/nfc_poller.h>
+#include <nfc/protocols/nfc_protocol.h>
+#include <nfc/protocols/iso14443_3a/iso14443_3a.h>
+#include <nfc/protocols/iso14443_3a/iso14443_3a_poller.h>
 
 #include "core/bridge_core.h"
 #include "core/bridge_diag.h"
@@ -41,11 +47,12 @@
 #include "modules/module_notify.h"
 #include "modules/module_ir.h"
 #include "modules/module_object.h"
+#include "modules/module_nfc.h"
 
 #if MB_RELEASE_BUILD
 #define BRIDGE_BUILD_ID "mb-1.0-rel-1"
 #else
-#define BRIDGE_BUILD_ID "mb-0.12-c15-2"
+#define BRIDGE_BUILD_ID "mb-0.13-c16-1"
 #endif
 #define BRIDGE_BAUD 230400
 #define BRIDGE_AUTO_EXIT_MS (600U * 1000U) /* dev-only bench safety net (compiled out of release); 600 s since C15 — witness-judged cases run minutes */
@@ -109,6 +116,13 @@ typedef struct {
     MbObjectStore objects;
     MbIdentity obj_seen_identity;
     bool obj_seen_valid;
+    /* C16 NFC: one instance per job (scanner XOR poller). */
+    MbNfcScanParams nfc_scan_params;
+    MbNfcIdentifyParams nfc_id_params;
+    MbNfcHal nfc_hal;
+    Nfc* nfc;
+    NfcScanner* nfc_scanner;
+    NfcPoller* nfc_poller;
     /* Bench signals: signal_listen is the truth (a hardware-
      * listening job or a host LISTEN_ON is active); the main loop
      * flashes the LED while it is set. signal_muted silences the
@@ -471,7 +485,8 @@ static const NotificationSequence bridge_seq_short_vibro = {
     &message_delay_100,
     &message_vibro_off,
     NULL};
-/* Bench signals: double beep = a listening period starts/ends;
+/* Bench signals: the double beep is the "got it" acknowledgment
+ * (v2: it fires only when a listening job receives its signal);
  * a one-second blue blink repeats while the device is listening. */
 static const NotificationSequence bridge_seq_double_beep = {
     &message_note_a5,
@@ -486,6 +501,24 @@ static const NotificationSequence bridge_seq_listen_blink = {
     &message_blue_255,
     &message_delay_100,
     &message_blue_0,
+    NULL};
+/* Bench signals v2: red flashes at exit = something went wrong
+ * (error / overflow / forced exit). */
+static const NotificationSequence bridge_seq_error_flash = {
+    &message_red_255,
+    &message_delay_100,
+    &message_delay_50,
+    &message_red_0,
+    &message_delay_100,
+    &message_red_255,
+    &message_delay_100,
+    &message_delay_50,
+    &message_red_0,
+    &message_delay_100,
+    &message_red_255,
+    &message_delay_100,
+    &message_delay_50,
+    &message_red_0,
     NULL};
 
 static void bridge_notify_play(void* ctx, uint8_t effect) {
@@ -523,11 +556,22 @@ static void bridge_notify_play(void* ctx, uint8_t effect) {
     notification_message_block(app->notification, seq);
 }
 
-/* Automatic listening signals for hardware jobs (respect the mute
- * gate; called on the executor thread from the module glue). */
-static void bridge_signal_beeps(BridgeApp* app) {
+/* Automatic listening signals, bench language v2 (operator design,
+ * 2026-10-08): listening starts SILENT (the LED flag is set by the
+ * glue); the double beep means exactly one thing — the intended
+ * signal was received ("got it"); a clean close, including an
+ * empty window, is silent; red flashes at exit mean something
+ * went wrong. Both respect the mute gate; called on the executor
+ * thread. */
+static void bridge_signal_received(void* ctx) {
+    BridgeApp* app = ctx;
     if(app == NULL || app->notification == NULL || app->signal_muted) return;
     notification_message_block(app->notification, &bridge_seq_double_beep);
+}
+
+static void bridge_signal_error(BridgeApp* app) {
+    if(app == NULL || app->notification == NULL || app->signal_muted) return;
+    notification_message_block(app->notification, &bridge_seq_error_flash);
 }
 
 static void bridge_signal_set_listen(BridgeApp* app, bool on) {
@@ -561,9 +605,8 @@ static bool bridge_ir_rx_start(void* ctx) {
     infrared_worker_rx_set_received_signal_callback(
         app->ir_worker, bridge_ir_on_signal, app);
     infrared_worker_rx_enable_signal_decoding(app->ir_worker, true);
-    bridge_signal_beeps(app); /* listening opens when the beeps end */
     infrared_worker_rx_start(app->ir_worker);
-    bridge_signal_set_listen(app, true);
+    bridge_signal_set_listen(app, true); /* v2: silent start */
     return true;
 }
 
@@ -575,9 +618,8 @@ static bool bridge_ir_rx_start_raw(void* ctx) {
     infrared_worker_rx_set_received_signal_callback(
         app->ir_worker, bridge_ir_on_signal, app);
     infrared_worker_rx_enable_signal_decoding(app->ir_worker, false);
-    bridge_signal_beeps(app); /* listening opens when the beeps end */
     infrared_worker_rx_start(app->ir_worker);
-    bridge_signal_set_listen(app, true);
+    bridge_signal_set_listen(app, true); /* v2: silent start */
     return true;
 }
 
@@ -588,7 +630,8 @@ static void bridge_ir_rx_stop(void* ctx) {
     infrared_worker_rx_stop(app->ir_worker);
     infrared_worker_free(app->ir_worker);
     app->ir_worker = NULL;
-    bridge_signal_beeps(app); /* listening has ended */
+    /* v2: silent close; a received beep already fired at the first
+     * signal, and error exits flash red at terminal publication. */
 }
 
 /* ---- C13 IR TX glue. The get-signal callback runs on the worker
@@ -642,6 +685,104 @@ static void bridge_ir_tx_stop(void* ctx) {
     infrared_worker_tx_stop(app->ir_worker); /* waits out in-flight signal */
     infrared_worker_free(app->ir_worker);
     app->ir_worker = NULL;
+}
+
+/* ---- C16 NFC glue. One Nfc instance per job; scanner XOR poller.
+ * Callbacks run on the NFC worker thread: they translate and copy
+ * into the portable module immediately and never retain platform
+ * pointers; stop/free happens here on the executor thread. ---- */
+static void bridge_nfc_scan_cb(NfcScannerEvent event, void* ctx) {
+    UNUSED(ctx);
+    if(event.type != NfcScannerEventTypeDetected) return;
+    uint16_t mapped[MB_NFC_MAX_CANDIDATES];
+    size_t n = event.data.protocol_num;
+    if(n > MB_NFC_MAX_CANDIDATES) n = MB_NFC_MAX_CANDIDATES;
+    for(size_t i = 0; i < n; i++) {
+        NfcProtocol p = event.data.protocols[i];
+        mapped[i] = (p == NfcProtocolIso14443_3a ||
+                     nfc_protocol_has_parent(p, NfcProtocolIso14443_3a)) ?
+                        MB_NFC_PROTOCOL_ISO14443_3A :
+                        0;
+    }
+    mb_nfc_on_candidates(mapped, n);
+}
+
+static bool bridge_nfc_scan_start(void* ctx) {
+    BridgeApp* app = ctx;
+    if(app->nfc != NULL) return false;
+    app->nfc = nfc_alloc();
+    if(app->nfc == NULL) return false;
+    app->nfc_scanner = nfc_scanner_alloc(app->nfc);
+    if(app->nfc_scanner == NULL) {
+        nfc_free(app->nfc);
+        app->nfc = NULL;
+        return false;
+    }
+    nfc_scanner_start(app->nfc_scanner, bridge_nfc_scan_cb, app);
+    bridge_signal_set_listen(app, true); /* v2: silent start */
+    return true;
+}
+
+static void bridge_nfc_scan_stop(void* ctx) {
+    BridgeApp* app = ctx;
+    bridge_signal_set_listen(app, false);
+    if(app->nfc_scanner != NULL) {
+        nfc_scanner_stop(app->nfc_scanner);
+        nfc_scanner_free(app->nfc_scanner);
+        app->nfc_scanner = NULL;
+    }
+    if(app->nfc != NULL) {
+        nfc_free(app->nfc);
+        app->nfc = NULL;
+    }
+}
+
+static NfcCommand bridge_nfc_id_cb(NfcGenericEvent event, void* ctx) {
+    BridgeApp* app = ctx;
+    if(event.protocol != NfcProtocolIso14443_3a) return NfcCommandContinue;
+    const Iso14443_3aPollerEvent* e = event.event_data;
+    if(e == NULL) return NfcCommandContinue;
+    if(e->type == Iso14443_3aPollerEventTypeReady) {
+        const Iso14443_3aData* data = nfc_poller_get_data(app->nfc_poller);
+        if(data != NULL) {
+            /* Copy out inside the callback; the platform storage is
+             * borrowed and dies with the poller. */
+            mb_nfc_on_identify(data->uid, data->uid_len, data->atqa, data->sak);
+        }
+        return NfcCommandStop;
+    }
+    mb_nfc_on_identify_error();
+    return NfcCommandContinue;
+}
+
+static bool bridge_nfc_id_start(void* ctx) {
+    BridgeApp* app = ctx;
+    if(app->nfc != NULL) return false;
+    app->nfc = nfc_alloc();
+    if(app->nfc == NULL) return false;
+    app->nfc_poller = nfc_poller_alloc(app->nfc, NfcProtocolIso14443_3a);
+    if(app->nfc_poller == NULL) {
+        nfc_free(app->nfc);
+        app->nfc = NULL;
+        return false;
+    }
+    nfc_poller_start(app->nfc_poller, bridge_nfc_id_cb, app);
+    bridge_signal_set_listen(app, true); /* v2: silent start */
+    return true;
+}
+
+static void bridge_nfc_id_stop(void* ctx) {
+    BridgeApp* app = ctx;
+    bridge_signal_set_listen(app, false);
+    if(app->nfc_poller != NULL) {
+        nfc_poller_stop(app->nfc_poller);
+        nfc_poller_free(app->nfc_poller);
+        app->nfc_poller = NULL;
+    }
+    if(app->nfc != NULL) {
+        nfc_free(app->nfc);
+        app->nfc = NULL;
+    }
 }
 
 /* Semantic validation of a GPIO REQUEST (claim state read under the
@@ -754,6 +895,24 @@ static MbStatus bridge_ir_raw_rx_validate_req(MbFrame* frame, MbIrRawParams* out
     out->timeout_ms = mb_u32(frame->payload);
     MbStatus v;
     return mb_ir_raw_validate_params(out, &v) ? MB_OK : v;
+}
+
+/* ---- C16 NFC validators ---- */
+static MbStatus bridge_nfc_scan_validate_req(MbFrame* frame, MbNfcScanParams* out) {
+    *out = (MbNfcScanParams){0};
+    if(frame->length != 4) return MB_INVALID_ARGUMENT;
+    out->timeout_ms = mb_u32(frame->payload);
+    MbStatus v;
+    return mb_nfc_scan_validate_params(out, &v) ? MB_OK : v;
+}
+
+static MbStatus bridge_nfc_id_validate_req(MbFrame* frame, MbNfcIdentifyParams* out) {
+    *out = (MbNfcIdentifyParams){0};
+    if(frame->length != 6) return MB_INVALID_ARGUMENT;
+    out->protocol = mb_u16(frame->payload);
+    out->timeout_ms = mb_u32(frame->payload + 2);
+    MbStatus v;
+    return mb_nfc_identify_validate_params(out, &v) ? MB_OK : v;
 }
 
 static MbStatus bridge_ir_tx_raw_validate_req(BridgeApp* app, MbFrame* frame, MbIrTxRawParams* out) {
@@ -960,6 +1119,34 @@ static size_t bridge_gpio_result(BridgeApp* app, uint16_t op, MbStatus status, u
         w += 4;
         break;
     }
+    case MB_NFC_OP_SCAN: {
+        MbNfcScanSummary sum;
+        mb_nfc_scan_last_summary(&sum);
+        out[w++] = sum.mapped_count;
+        for(uint8_t i = 0; i < sum.mapped_count; i++) {
+            mb_put_u16(out + w, sum.mapped[i]);
+            w += 2;
+        }
+        out[w++] = sum.unmapped_count;
+        break;
+    }
+    case MB_NFC_OP_IDENTIFY: {
+        MbNfcIdentifySummary sum;
+        mb_nfc_identify_last_summary(&sum);
+        out[w++] = sum.found ? 1 : 0;
+        mb_put_u16(out + w, sum.found ? app->nfc_id_params.protocol : 0);
+        w += 2;
+        out[w++] = sum.uid_len;
+        memcpy(out + w, sum.uid, MB_NFC_UID_MAX);
+        w += MB_NFC_UID_MAX;
+        out[w++] = sum.atqa[0];
+        out[w++] = sum.atqa[1];
+        out[w++] = sum.sak;
+        uint32_t errs = sum.error_events > 0xFFFF ? 0xFFFF : sum.error_events;
+        mb_put_u16(out + w, (uint16_t)errs);
+        w += 2;
+        break;
+    }
     default:
         break;
     }
@@ -983,6 +1170,8 @@ static void bridge_handle_request(BridgeApp* app, MbFrame* frame) {
     MbIrRawParams rawrx = {0};
     MbIrTxRawParams rawtx = {0};
     MbObjParams obj = {0};
+    MbNfcScanParams nfcscan = {0};
+    MbNfcIdentifyParams nfcid = {0};
     bool is_gpio = frame->op >= MB_GPIO_OP_CONFIG && frame->op <= MB_GPIO_OP_RELEASE;
     bool is_adc = frame->op == MB_ADC_OP_READ;
     bool is_notify = frame->op == MB_NOTIFY_OP;
@@ -992,6 +1181,8 @@ static void bridge_handle_request(BridgeApp* app, MbFrame* frame) {
     bool is_raw_tx = frame->op == MB_OBJ_OP_TX_RAW;
     bool is_obj = frame->op == MB_OBJ_OP_BEGIN || frame->op == MB_OBJ_OP_CHUNK ||
                   frame->op == MB_OBJ_OP_COMMIT || frame->op == MB_OBJ_OP_RELEASE;
+    bool is_nfc_scan = frame->op == MB_NFC_OP_SCAN;
+    bool is_nfc_id = frame->op == MB_NFC_OP_IDENTIFY;
 #if !MB_RELEASE_BUILD
     if(frame->op == BRIDGE_OP_FAKE_RUN) {
         if(frame->length != 6) {
@@ -1023,6 +1214,10 @@ static void bridge_handle_request(BridgeApp* app, MbFrame* frame) {
         rejection = bridge_ir_tx_raw_validate_req(app, frame, &rawtx);
     } else if(is_obj) {
         rejection = bridge_object_validate_req(frame, &obj);
+    } else if(is_nfc_scan) {
+        rejection = bridge_nfc_scan_validate_req(frame, &nfcscan);
+    } else if(is_nfc_id) {
+        rejection = bridge_nfc_id_validate_req(frame, &nfcid);
     } else {
         rejection = MB_UNSUPPORTED;
     }
@@ -1147,6 +1342,23 @@ static void bridge_handle_request(BridgeApp* app, MbFrame* frame) {
         app->obj_params = obj;
         module = &mb_module_object;
         params = &app->obj_params;
+    } else if(is_nfc_scan || is_nfc_id) {
+        /* Timed listening jobs; same deadline shape as IR RX: the
+         * module's own timeout plus the 5 s wedge guard. */
+        uint32_t tmo = is_nfc_scan ? nfcscan.timeout_ms : nfcid.timeout_ms;
+        uint32_t dur = 0, grace = 0;
+        mb_ticks_from_ms(tmo, hz, &dur);
+        mb_ticks_from_ms(5000, hz, &grace);
+        deadline = dur + grace;
+        if(is_nfc_scan) {
+            app->nfc_scan_params = nfcscan;
+            module = &mb_module_nfc_scan;
+            params = &app->nfc_scan_params;
+        } else {
+            app->nfc_id_params = nfcid;
+            module = &mb_module_nfc_identify;
+            params = &app->nfc_id_params;
+        }
     } else {
         uint32_t dur_ticks = 0, int_ticks = 0, grace = 0;
         mb_ticks_from_ms(duration_ms, hz, &dur_ticks);
@@ -1249,7 +1461,7 @@ static void bridge_handle_frame(BridgeApp* app, const uint8_t* encoded, size_t e
         resp[w++] = 0; /* app minor */
 #else
         resp[w++] = 0; /* app major */
-        resp[w++] = 11; /* app minor: ...10=C13 ir tx, 11=C15 raw ir + objects */
+        resp[w++] = 12; /* app minor: ...11=C15 raw ir + objects, 12=C16 NFC + signals v2 */
 #endif
         mb_put_u16(resp + w, 87);
         w += 2; /* fw_api_major the SDK was built against */
@@ -1297,6 +1509,8 @@ static void bridge_handle_frame(BridgeApp* app, const uint8_t* encoded, size_t e
             {MB_IR_OP_TX_DECODED, 1, MB_IR_MAX_TIMEOUT_MS}, /* limit = max timeout ms */
             {MB_OBJ_OP_RX_RAW_START, 1, MB_IR_MAX_TIMEOUT_MS},
             {MB_OBJ_OP_TX_RAW, 1, MB_IR_MAX_TIMEOUT_MS},
+            {MB_NFC_OP_SCAN, 1, MB_NFC_MAX_TIMEOUT_MS}, /* limit = max timeout ms */
+            {MB_NFC_OP_IDENTIFY, 1, MB_NFC_MAX_TIMEOUT_MS}, /* limit = max timeout ms */
             {MB_OBJ_OP_BEGIN, 1, MB_OBJ_MAX_TIMINGS}, /* limit = max timings */
             {MB_OBJ_OP_CHUNK, 1, MB_OBJ_CHUNK_MAX}, /* limit = durations per chunk */
             {MB_OBJ_OP_COMMIT, 1, 0},
@@ -1621,6 +1835,10 @@ static void bridge_write_result(BridgeApp* app) {
         mb_ir_raw_last_summary(&irraws);
         MbIrTxRawSummary irrawtxs;
         mb_ir_tx_raw_last_summary(&irrawtxs);
+        MbNfcScanSummary nfcscans;
+        mb_nfc_scan_last_summary(&nfcscans);
+        MbNfcIdentifySummary nfcids;
+        mb_nfc_identify_last_summary(&nfcids);
         int len = snprintf(
             buf,
             sizeof(buf),
@@ -1631,6 +1849,7 @@ static void bridge_write_result(BridgeApp* app) {
             "adc_rd=%lu adc_smp=%lu ntfy=%lu ir_dec=%lu ir_emit=%lu ir_drop=%lu "
             "ir_tx_sup=%lu ir_tx_sent=%lu ir_raw_cap=%lu ir_raw_over=%lu "
             "ir_rawtx_sup=%lu ir_rawtx_sent=%lu ir_rawtx_tot=%lu "
+            "nfc_scan=%lu nfc_id=%lu nfc_err=%lu "
             "data_gen=%lu data_enq=%lu data_drop=%lu data_consumed=%lu exec_beats=%lu "
             "heap_sf=%lu heap_smin=%lu heap_sblk=%lu heap_ef=%lu heap_emin=%lu heap_eblk=%lu "
             "rx_bytes_1s=%lu rx_errors_1s=%lu "
@@ -1671,6 +1890,9 @@ static void bridge_write_result(BridgeApp* app) {
             (unsigned long)irrawtxs.supplied,
             (unsigned long)irrawtxs.sent,
             (unsigned long)irrawtxs.tx_total,
+            (unsigned long)nfcscans.scans_total,
+            (unsigned long)nfcids.ids_total,
+            (unsigned long)nfcids.error_events,
             (unsigned long)app->exec.generated,
             (unsigned long)app->exec.enqueued,
             (unsigned long)app->exec.dropped,
@@ -1781,6 +2003,16 @@ int32_t muse_bridge_app(void* context) {
     mb_object_module_bind(&app->objects, &app->session.lease.identity, bridge_now_ms);
     MbIrTxRawBind raw_bind = {.pin = bridge_obj_pin, .unpin = bridge_obj_unpin, .ctx = app};
     mb_ir_tx_raw_bind(&raw_bind);
+    /* C16: NFC module + bench-signals v2 received hooks. */
+    app->nfc_hal = (MbNfcHal){
+        .scan_start = bridge_nfc_scan_start,
+        .scan_stop = bridge_nfc_scan_stop,
+        .identify_start = bridge_nfc_id_start,
+        .identify_stop = bridge_nfc_id_stop,
+        .ctx = app};
+    mb_nfc_module_bind(&app->nfc_hal);
+    mb_ir_set_received_hook(bridge_signal_received, app);
+    mb_nfc_set_received_hook(bridge_signal_received, app);
     app->notification = furi_record_open(RECORD_NOTIFICATION);
     app->exec_thread = furi_thread_alloc_ex("MbExec", 2048, bridge_exec_thread, app);
     furi_thread_start(app->exec_thread);
@@ -1958,6 +2190,17 @@ int32_t muse_bridge_app(void* context) {
                 bridge_send_frame_as(
                     app, &app->session.lease.identity, 12, done_op,
                     term_status, term_job, result, result_len);
+                /* Bench signals v2: a listening job that ends in an
+                 * error state (overflow, cancel, executor timeout,
+                 * init/cleanup failure) flashes red at exit — the
+                 * operator's "something went wrong" cue. Clean
+                 * endings (including honest empty windows) stay
+                 * silent; the received beep fired at first signal. */
+                if((done_op == MB_IR_OP_RX_START || done_op == MB_OBJ_OP_RX_RAW_START ||
+                    done_op == MB_NFC_OP_SCAN || done_op == MB_NFC_OP_IDENTIFY) &&
+                   term_status != MB_OK) {
+                    bridge_signal_error(app);
+                }
                 /* Module stopped, cleanup done, outcome durable, slot
                  * released: the hardware is quiescent (C08). */
                 bridge_trace(app, MB_EV_HW_QUIESCENT, term_job, (uint32_t)term_status);
