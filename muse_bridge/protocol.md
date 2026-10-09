@@ -346,7 +346,7 @@ cases must verify their signal actions COMPLETE.
 
 ## Raw IR + bounded objects (C15, ops 0x0410/0x0411, 0x0901–0x0905)
 
-Design: `docs/c15-raw-ir-design.md` (plan §22.3/22.4). One mutable
+One mutable
 object slot and one committed slot, each a fixed 512×u32 buffer of
 microsecond durations plus metadata — no allocation after boot.
 Objects are session-owned; the object id is the creating action's
@@ -419,9 +419,8 @@ must be armed after the operator's part ends (see the C15W case).
 
 ## NFC discovery + identify (C16, ops 0x0501/0x0502)
 
-Design: `docs/c16-nfc-design.md` (plan §10.6 steps A+B, §22.3,
-§22.4). Discovery and identification only — no card content read
-(step C), no emulation (step D). One `Nfc*` per job, allocated
+Discovery and identification only — no card content read,
+no emulation. One `Nfc*` per job, allocated
 and freed in the glue on the executor thread; scanner and poller
 never coexist.
 

@@ -2,27 +2,14 @@
 
 ## 2026-10-08 — NFC discovery + identify, bench signals v2
 
-- **NFC discovery**: a scan action reports which portable card
-  protocol families are nearby — candidates translated by protocol
-  ancestry, never raw platform enum values, so an unrecognized
-  card type is counted but can never steer the device
-- **NFC identify (ISO14443-3A)**: returns a card's UID (4/7/10
-  bytes), ATQA, and SAK in a fixed record; a card that leaves the
-  field leaves no stale data behind — the next read returns a
-  fully zeroed record. Wrong-protocol requests are refused before
-  any radio allocation. Discovery and identification only: no
-  card content is read and nothing is emulated
-- Verified on hardware against a MIFARE Classic 1K card whose
-  stock-app reading was taken first: the bridge's identify matched
-  it byte for byte; a same-session removal read empty; a long scan
-  cancelled mid-window terminated as cancelled; 100 consecutive
-  identifies returned the same UID 100 times
-- **Bench signals v2** (revising the same-day v1): listening now
-  starts silently — the flashing LED is the only "listening"
-  signal — a single beep means exactly one thing ("got it"),
-  clean closes are silent, and a listening job that ends badly
-  flashes red on its way out. The mute gate now covers all
-  automatic annunciation
+- NFC scan (which card protocol families are nearby) and
+  ISO14443-3A identify (UID, ATQA, SAK). No card content read,
+  no emulation. Verified on hardware against a MIFARE Classic
+  card, including card removal, mid-window cancel, and 100
+  consecutive identifies.
+- Bench signals v2: listening starts silently (flashing LED),
+  one beep when a signal lands, red flashes when a listening
+  job ends badly. The mute gate covers all automatic signals.
 
 ## 2026-10-08 — Raw IR + bench signals
 
